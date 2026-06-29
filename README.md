@@ -57,6 +57,10 @@ I built this server to take advantage of the new Raspberry PI 5 feature to run o
    1. The system can discover and utilize plugins to extend basic functionality
    2. Plugins can use Arguments or Properties
 
+### Firefox Extension
+
+Use the [Limited Media Tracker Firefox Extension](https://github.com/mgatelabs/LimitedMediaTracker) to easily add content to your server directly from your browser.
+
 ### Example Media Browser
 
 ![image](https://github.com/user-attachments/assets/56eab409-3375-40b7-9312-dc4cbd167817)=

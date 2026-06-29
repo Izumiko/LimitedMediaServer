@@ -17,8 +17,9 @@ from ffmpeg_utils import encode_video, FFMPEG_PRESET, FFMPEG_PRESET_VALUES, FFMP
 from file_utils import temporary_folder
 from media_queries import insert_file, find_files_in_folder
 from media_utils import get_data_for_mediafile, get_file_by_user, \
-    get_folder_by_user, describe_file_size_change
+    get_folder_by_user, describe_file_size_change, clean_files_for_mediafile
 from plugin_system import ActionMediaFilePlugin, ActionMediaFilesPlugin
+from plugin_methods import plugin_string_arg, plugin_select_arg, plugin_select_values
 from text_utils import is_not_blank, is_blank, clean_string
 from thread_utils import TaskWrapper
 
@@ -66,6 +67,13 @@ class EncodeForFilePlugin(ActionMediaFilePlugin):
         result.append(FFMPEG_CRF)
         result.append(FFMPEG_AUDIO_BIT)
         result.append(FFMPEG_STEREO)
+        result.append(plugin_string_arg('Postfix', 'postfix', 'Suffix added before the extension (default: _enc)'))
+
+        result.append(
+            plugin_select_arg('Clean Up', 'cleanup', 'keep',
+                              plugin_select_values('Keep', 'keep', 'Purge', 'purge', 'Rename', 'rename'),
+                              'What to do with the source file after a successful encode.', adv='Y')
+        )
 
         return result
 
@@ -105,6 +113,18 @@ class EncodeForFilePlugin(ActionMediaFilePlugin):
             if args['ffmpeg_mix'] not in FFMPEG_STEREO_VALUES:
                 results.append('unknown ffmpeg_mix value')
 
+        if 'postfix' not in args or is_blank(args['postfix']):
+            args['postfix'] = '_enc'
+        else:
+            args['postfix'] = clean_string(args['postfix'])
+
+        if 'cleanup' not in args or is_blank(args['cleanup']):
+            args['cleanup'] = 'keep'
+        else:
+            args['cleanup'] = clean_string(args['cleanup'])
+            if args['cleanup'] not in ('keep', 'purge', 'rename'):
+                results.append('Invalid cleanup value')
+
         if len(results) > 0:
             return results
         return None
@@ -116,7 +136,8 @@ class EncodeForFilePlugin(ActionMediaFilePlugin):
         return EncodeJob("EncodeFile", 'Encoding: ' + args['file_id'], args['file_id'], args['ffmpeg_preset'],
                          args['ffmpeg_crf'],
                          self.primary_path, self.archive_path, self.temp_path, int(args['ffmpeg_abr']),
-                         args['ffmpeg_mix'] == 't', self.media_encoder_host, self.media_encoder_port)
+                         args['ffmpeg_mix'] == 't', self.media_encoder_host, self.media_encoder_port,
+                         postfix=args['postfix'], cleanup=args['cleanup'])
 
 
 class EncodeForFilesPlugin(ActionMediaFilesPlugin):
@@ -162,6 +183,13 @@ class EncodeForFilesPlugin(ActionMediaFilesPlugin):
         result.append(FFMPEG_CRF)
         result.append(FFMPEG_AUDIO_BIT)
         result.append(FFMPEG_STEREO)
+        result.append(plugin_string_arg('Postfix', 'postfix', 'Suffix added before the extension (default: _enc)'))
+
+        result.append(
+            plugin_select_arg('Clean Up', 'cleanup', 'keep',
+                              plugin_select_values('Keep', 'keep', 'Purge', 'purge', 'Rename', 'rename'),
+                              'What to do with the source file after a successful encode.', adv='Y')
+        )
 
         return result
 
@@ -201,6 +229,18 @@ class EncodeForFilesPlugin(ActionMediaFilesPlugin):
             if args['ffmpeg_mix'] not in FFMPEG_STEREO_VALUES:
                 results.append('unknown ffmpeg_mix value')
 
+        if 'postfix' not in args or is_blank(args['postfix']):
+            args['postfix'] = '_enc'
+        else:
+            args['postfix'] = clean_string(args['postfix'])
+
+        if 'cleanup' not in args or is_blank(args['cleanup']):
+            args['cleanup'] = 'keep'
+        else:
+            args['cleanup'] = clean_string(args['cleanup'])
+            if args['cleanup'] not in ('keep', 'purge', 'rename'):
+                results.append('Invalid cleanup value')
+
         if len(results) > 0:
             return results
         return None
@@ -218,7 +258,8 @@ class EncodeForFilesPlugin(ActionMediaFilesPlugin):
             result.append(EncodeJob("EncodeFile", 'Encoding: ' + file_id, file_id, args['ffmpeg_preset'],
                                     args['ffmpeg_crf'],
                                     self.primary_path, self.archive_path, self.temp_path, int(args['ffmpeg_abr']),
-                                    args['ffmpeg_mix'] == 't', self.media_encoder_host, self.media_encoder_port))
+                                    args['ffmpeg_mix'] == 't', self.media_encoder_host, self.media_encoder_port,
+                                    postfix=args['postfix'], cleanup=args['cleanup']))
 
         return result
 
@@ -227,7 +268,7 @@ class EncodeJob(TaskWrapper):
     def __init__(self, name, description, file_id, ffmpeg_preset: str, ffmpeg_crf: str, primary_folder: str,
                  archive_folder: str,
                  temp_folder: str, audio_bit_rate: int = 128, stereo: bool = True, encoder_host: str | None = None,
-                 encoder_port: int | None = 8080):
+                 encoder_port: int | None = 8080, postfix: str = '_enc', cleanup: str = 'keep'):
         super().__init__(name, description)
         self.file_id = file_id
         self.folder_id = None
@@ -236,6 +277,8 @@ class EncodeJob(TaskWrapper):
         self.temp_folder = temp_folder
         self.ffmpeg_preset = ffmpeg_preset
         self.ffmpeg_crf = int(ffmpeg_crf)
+        self.postfix = postfix
+        self.cleanup = cleanup
         self.weight = 70
         if encoder_host is not None and len(encoder_host) > 0:
             self.weight = 10
@@ -243,6 +286,21 @@ class EncodeJob(TaskWrapper):
         self.stereo = stereo
         self.encoder_host = encoder_host
         self.encoder_port = encoder_port
+
+    def _apply_cleanup(self, file: MediaFile, db_session: Session):
+        if self.cleanup == 'keep':
+            return
+        try:
+            if self.cleanup == 'purge':
+                clean_files_for_mediafile(file, self.primary_folder, self.archive_folder)
+                db_session.delete(file)
+                self.info(f'Purged source file: {file.filename}')
+            elif self.cleanup == 'rename':
+                stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                file.filename = f'{stamp}_{file.filename}'
+                self.info(f'Renamed source record to: {file.filename}')
+        except OSError as e:
+            self.warn(f'Clean up failed for {file.filename}: {e}')
 
     def run(self, db_session: Session):
 
@@ -334,7 +392,11 @@ class EncodeJob(TaskWrapper):
 
                         src_path = Path(temp_folder) / 'temp.mp4'
 
-                        file_name = file.filename + '_encoded'
+                        base, ext = os.path.splitext(file.filename)
+                        if not ext:
+                            file_name = file.filename + '.mp4'
+                        else:
+                            file_name = base + self.postfix + ext
                         file_size = src_path.stat().st_size
                         created_time = datetime.fromtimestamp(src_path.stat().st_ctime)
                         mime_type, _ = mimetypes.guess_type(src_path)
@@ -361,6 +423,9 @@ class EncodeJob(TaskWrapper):
                         self.info(describe_file_size_change(file.filesize, new_file.filesize))
 
                         shutil.move(str(src_path), str(dest_path))
+
+                        self._apply_cleanup(file, db_session)
+                        db_session.commit()
 
                         self.set_worked()
                     else:

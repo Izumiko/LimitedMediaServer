@@ -1,19 +1,18 @@
 from datetime import datetime
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Type
 
 from flask_sqlalchemy.session import Session
-from sqlalchemy import and_
+from sqlalchemy import and_, cast, Integer
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.orm import joinedload
 
-from db import MediaFolder, MediaFile, db, MediaFileProgress
+from db import MediaFolder, MediaFile, db, MediaFileProgress, MediaFolderTag
 from text_utils import is_not_blank
 
 
 # Insert or Update Folder
-def insert_folder(parent_id: str, name: str, rating: int, info_url: str, tags: str, active: bool,
-                  group_id: Optional[int],
-                  db_session: Session = db.session):
+def insert_folder(parent_id: str, name: str, rating: int, info_url: str, fast_tags, tags: str, active: bool,
+                  group_id: Optional[int], db_session: Session = db.session):
     """
     Insert a new folder or update an existing one.
 
@@ -28,6 +27,7 @@ def insert_folder(parent_id: str, name: str, rating: int, info_url: str, tags: s
 
     Returns:
         None
+        :param fast_tags:
     """
     if len(parent_id) == 0:
         parent_id = None
@@ -38,6 +38,7 @@ def insert_folder(parent_id: str, name: str, rating: int, info_url: str, tags: s
         preview=False,
         parent_id=parent_id,
         info_url=info_url,
+        folder_tag_mask=fast_tags,
         tags=tags,
         owning_group_id=group_id,
         active=active
@@ -45,16 +46,18 @@ def insert_folder(parent_id: str, name: str, rating: int, info_url: str, tags: s
 
     db_session.add(new_folder)
     db_session.commit()
+    db_session.refresh(new_folder)
+    return new_folder
 
 
 # Update Folder
-def update_folder(folder_id: str, name: str, rating: int, info_url: str, tags: str, active: bool,
-                  group_id: Optional[int],
-                  db_session: Session = db.session) -> bool:
+def update_folder(folder_id: str, name: str, rating: int, info_url: str, tags: str, tag_number: int, active: bool,
+                  group_id: Optional[int], db_session: Session = db.session) -> bool:
     """
     Update an existing folder.
 
     Args:
+        :param tag_number:
         :param folder_id: The ID of the folder to update.
         :param name: The new name of the folder.
         :param rating: The new rating of the folder.
@@ -77,6 +80,7 @@ def update_folder(folder_id: str, name: str, rating: int, info_url: str, tags: s
         existing_folder.tags = tags
         existing_folder.owning_group_id = group_id
         existing_folder.active = active
+        existing_folder.folder_tag_mask = tag_number
 
         db_session.commit()
 
@@ -86,7 +90,8 @@ def update_folder(folder_id: str, name: str, rating: int, info_url: str, tags: s
 
 
 def _build_folders_in_folders_query(folder_id: str, db_session: Session = None, filter_text: str = None,
-                                    max_rating: int = 0):
+                                    max_rating: int = 0, required_tags: int = 0,
+                                    hidden_tags: int = 0, ):
     if db_session is not None:
         query_builder = db_session.query(MediaFolder)
     else:
@@ -100,17 +105,31 @@ def _build_folders_in_folders_query(folder_id: str, db_session: Session = None, 
 
     query_builder = query_builder.filter(MediaFolder.parent_id == folder_id)
 
+    # Cast NUMERIC to INTEGER/BIGINT for bitwise operations
+    tag_mask = cast(MediaFolder.folder_tag_mask, Integer)
+
+    # Must include ALL required bits
+    if required_tags and required_tags != 0:
+        query_builder = query_builder.filter((tag_mask.op("&")(required_tags)) == required_tags)
+
+    # Must include NONE of the hidden bits
+    if hidden_tags and hidden_tags != 0:
+        query_builder = query_builder.filter((tag_mask.op("&")(hidden_tags)) == 0)
+
     return query_builder
 
 
 # Find Folders in Folder
 def find_folders_in_folder(folder_id: str, filter_text: str = None, max_limit: int = 0, query_offset: int = 0,
                            query_limit: int = 0, sort_column=MediaFolder.name, sort_descending: bool = False,
+                           required_tags=0, hidden_tags=0,
                            db_session: Session = None) -> Optional[List[type[MediaFolder]]]:
     """
     Find all subfolders in a specific folder.
 
     Args:
+        :param required_tags:
+        :param hidden_tags:
         :param folder_id: The ID of the parent folder.
         :param db_session: The database session to use. Defaults to None.
         :param filter_text: Text that will be searched for
@@ -124,7 +143,7 @@ def find_folders_in_folder(folder_id: str, filter_text: str = None, max_limit: i
 
     """
 
-    query = _build_folders_in_folders_query(folder_id, db_session, filter_text, max_limit)
+    query = _build_folders_in_folders_query(folder_id, db_session, filter_text, max_limit, required_tags, hidden_tags)
 
     if sort_descending:
         query = query.order_by(sort_column.desc(), MediaFolder.id.desc())
@@ -140,12 +159,14 @@ def find_folders_in_folder(folder_id: str, filter_text: str = None, max_limit: i
     return query.all()
 
 
-def count_folders_in_folder(folder_id: str, filter_text: str = None, max_rating: int = 0,
-                            db_session: Session = None) -> int:
+def count_folders_in_folder(folder_id: str, filter_text: str = None, max_rating: int = 0, required_tags=0,
+                            hidden_tags=0, db_session: Session = None) -> int:
     """
     Count the number of subfolders in a specific folder.
 
     Args:
+        :param required_tags:
+        :param hidden_tags:
         :param folder_id: The ID of the parent folder.
         :param db_session:  The database session to use. Defaults to None.
         :param filter_text: (Optional) Text string must exist in entry name
@@ -155,7 +176,8 @@ def count_folders_in_folder(folder_id: str, filter_text: str = None, max_rating:
 
     """
 
-    return _build_folders_in_folders_query(folder_id, db_session, filter_text, max_rating).count()
+    return _build_folders_in_folders_query(folder_id, db_session, filter_text, max_rating, required_tags,
+                                           hidden_tags).count()
 
 
 # Find Folder by ID
@@ -198,20 +220,25 @@ def find_all_folders(db_session: Session = db.session):
 
 # Find Root Folders
 def find_root_folders(filter_text: str = None, max_limit: int = 0, query_offset: int = 0, query_limit: int = 0,
-                      sort_column=MediaFolder.name, sort_descending: bool = False, db_session: Session = None) -> \
+                      sort_column=MediaFolder.name, sort_descending: bool = False, required_tags=0, hidden_tags=0,
+                      db_session: Session = None) -> \
         Optional[
             List[type[MediaFolder]]]:
     """
     Find all root folders (folders without a parent).
 
     Args:
+        :param required_tags:
+        :param hidden_tags:
         :param filter_text:
         :param max_limit:
         :param query_offset:
         :param query_limit:
         :param sort_column:
         :param sort_descending:
-        :param db_session (Session, optional): The database session to use. Defaults to None.
+        :param required_tags:
+        :param hidden_tags:
+        :param db_session:  The database session to use. Defaults to None.
     Returns:
         Optional[List[MediaFolder]]: A list of root MediaFolder objects or None if not found.
 
@@ -230,10 +257,22 @@ def find_root_folders(filter_text: str = None, max_limit: int = 0, query_offset:
     if query_limit > 0:
         query = query.limit(query_limit)
 
+    # Cast NUMERIC to INTEGER/BIGINT for bitwise operations
+    tag_mask = cast(MediaFolder.folder_tag_mask, Integer)
+
+    # Must include ALL required bits
+    if required_tags and required_tags != 0:
+        query = query.filter((tag_mask.op("&")(required_tags)) == required_tags)
+
+    # Must include NONE of the hidden bits
+    if hidden_tags and hidden_tags != 0:
+        query = query.filter((tag_mask.op("&")(hidden_tags)) == 0)
+
     return query.all()
 
 
-def count_root_folders(filter_text: str = None, max_limit: int = 0, db_session: Session = None) -> int:
+def count_root_folders(filter_text: str = None, max_limit: int = 0, required_tags=0, hidden_tags=0,
+                       db_session: Session = None) -> int:
     """
     Find all root folders (folders without a parent).
 
@@ -244,9 +283,22 @@ def count_root_folders(filter_text: str = None, max_limit: int = 0, db_session: 
 
     Returns:
         count of number of rows
+        :param required_tags:
+        :param hidden_tags:
     """
 
     query = _build_root_folders_query(filter_text, max_limit, db_session)
+
+    # Cast NUMERIC to INTEGER/BIGINT for bitwise operations
+    tag_mask = cast(MediaFolder.folder_tag_mask, Integer)
+
+    # Must include ALL required bits
+    if required_tags and required_tags != 0:
+        query = query.filter((tag_mask.op("&")(required_tags)) == required_tags)
+
+    # Must include NONE of the hidden bits
+    if hidden_tags and hidden_tags != 0:
+        query = query.filter((tag_mask.op("&")(hidden_tags)) == 0)
 
     return query.count()
 
@@ -583,3 +635,17 @@ def upsert_progress(user_id: int, file_id: str, progress: float, timestamp: date
         # Add and commit the new book
         db_session.add(new_progress)
         db_session.commit()
+
+
+def get_tag_row(bit: int, db_session: Session = db.session) -> Optional[MediaFolderTag]:
+    """
+    Get a single tag.
+    """
+    return MediaFolderTag.query.filter_by(bit=bit).first()
+
+
+def get_all_tags(db_session: Session = db.session) -> list[Type[MediaFolderTag]]:
+    """
+    List all tags.
+    """
+    return db_session.query(MediaFolderTag).order_by(MediaFolderTag.long_tag).all()

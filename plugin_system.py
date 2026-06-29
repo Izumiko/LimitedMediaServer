@@ -3,6 +3,7 @@ import argparse
 from flask_sqlalchemy.session import Session
 
 from app_properties import AppPropertyDefinition
+from app_utils import value_is_in_list
 from constants import PROPERTY_SERVER_MEDIA_PRIMARY_FOLDER, PROPERTY_SERVER_MEDIA_ARCHIVE_FOLDER, \
     PROPERTY_SERVER_MEDIA_TEMP_FOLDER, PROPERTY_SERVER_VOLUME_FOLDER, PROPERTY_SERVER_VOLUME_FORMAT, APP_KEY_PROCESSORS
 from plugin_methods import plugin_media_folder_display_arg, add_logging_arg, plugin_string_arg
@@ -50,7 +51,7 @@ class ActionPlugin:
 
     # noinspection PyMethodMayBeStatic
     def get_properties(self) -> list[AppPropertyDefinition]:
-        return []
+        return self.generate_properties()
 
     def use_args(self, args):
         raise NotImplementedError
@@ -109,6 +110,23 @@ class ActionPlugin:
 
     def get_feature_flags(self):
         return 0
+
+    def generate_properties(self):
+        args = self.get_action_args()
+        result = []
+        for arg in args:
+            if 'type' in arg and arg['type'] == 'select':
+                possible_values = ['']
+                possible_description = []
+                for value in arg['values']:
+                    possible_values.append(value['id'])
+                    possible_description.append('"' + value['id'] + '" : "' + value['name']+'"')
+
+                result.append(AppPropertyDefinition('PLUGIN.DEFAULT.' + self.get_action_id() + '_' + arg['id'], '',
+                                      'Default value for the argument ' + arg['name'] + '.  Value List: ' + '; '.join(possible_description),
+                                      [value_is_in_list(possible_values)]))
+
+        return result
 
 
 # Subclass for series action plugins

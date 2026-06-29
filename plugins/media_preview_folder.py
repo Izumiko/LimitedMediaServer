@@ -436,9 +436,11 @@ class MakeMediaPreviewJob(TaskWrapper):
                         for file in file_list:
                             media_file, media_folder = get_file_by_user(file, self.user, db_session)
                             self.ref_folder_id = media_folder.id
+                            self.ref_folder_preview = media_folder.preview == True
                     else:
                         media_file, media_folder = get_file_by_user(self.file_id, self.user, db_session)
                         self.ref_folder_id = media_folder.id
+                        self.ref_folder_preview = media_folder.preview == True
                 else:
                     # Make sure we have access
                     self.trace('Checking for User access to Folder')

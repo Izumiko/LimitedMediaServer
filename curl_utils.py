@@ -4,10 +4,20 @@ import shlex
 import subprocess
 import tempfile
 import urllib
+from dataclasses import dataclass
 from typing import Optional
 
 from thread_utils import TaskWrapper, NoOpTaskWrapper
 from utility import random_sleep
+
+
+@dataclass
+class CurlResult:
+    success: bool
+    http_status: Optional[int]
+    return_code: int
+    stdout: str
+    stderr: str
 
 
 def extract_binary_content(input_file, output_file, task_wrapper: TaskWrapper):
@@ -88,6 +98,86 @@ def custom_curl_get(url, headers=None, download_file=None, task_wrapper: TaskWra
         task_wrapper.set_failure()
         task_wrapper.error(f"Error: {e}")
         return False
+
+
+def adv_curl_get(url, headers=None, download_file=None, task_wrapper: TaskWrapper = NoOpTaskWrapper(),
+                 insecure: bool = False, header_file=None) -> CurlResult:
+    """
+    This is to call the custom CHROM based CURL as a GET command
+    :param header_file:
+    :param url:
+    :param headers:
+    :param download_file:
+    :param task_wrapper:
+    :param insecure:
+    :param header_file:
+    :return:
+    """
+    if platform.system() != 'Linux':
+        return CurlResult(False, None, -1, '', 'Non-Linux platform')
+
+    command = [
+        'curl_chrome116', url,
+        '-L', '--max-redirs', '5',
+        '--connect-timeout', '10',
+        '-sS',
+        '--write-out', '%{http_code}'
+    ]
+    if headers:
+        for key, value in headers.items():
+            command.extend(['-H', f'{key}: {value}'])
+
+    if download_file:
+        command.extend(['-o', download_file])
+
+    if header_file is not None:
+        command.extend(['-D', header_file])
+
+    if insecure:
+        command.extend(['-k'])
+
+    if task_wrapper.can_trace():
+        task_wrapper.trace(shlex.join(command))
+
+    try:
+
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False
+        )
+
+        stdout = result.stdout.decode('utf-8').strip()
+        stderr = result.stderr.decode('utf-8')
+
+        http_status = None
+        if stdout.isdigit():
+            http_status = int(stdout)
+
+        success = (
+                result.returncode == 0 and
+                http_status is not None and
+                200 <= http_status < 300
+        )
+
+        if task_wrapper.can_trace():
+            task_wrapper.trace(f'HTTP Status: {http_status}')
+            task_wrapper.trace(f'Return Code: {result.returncode}')
+            task_wrapper.trace(f'Stderr: {stderr}')
+
+        return CurlResult(
+            success=success,
+            http_status=http_status,
+            return_code=result.returncode,
+            stdout=stdout,
+            stderr=stderr
+        )
+
+    except Exception as e:
+        task_wrapper.set_failure()
+        task_wrapper.error(str(e))
+        return CurlResult(False, None, -1, '', str(e))
 
 
 def custom_curl_get_raw(url, headers=None, download_file=None, task_wrapper: TaskWrapper = NoOpTaskWrapper(),
@@ -254,8 +344,19 @@ def read_temp_file(temp_file_path):
         return None
 
 
+def is_cloudflare_block(file_path) -> bool:
+    """Return True if the downloaded file looks like a Cloudflare challenge/block page."""
+    try:
+        with open(file_path, 'r', errors='ignore') as f:
+            head = f.read(4096)
+        lower = head.lower()
+        return '<title' in lower and 'cloudflare' in lower
+    except OSError:
+        return False
+
+
 def read_header_file(header_file_path) -> dict[str, str]:
-    headers = {}
+    headers = {'@HTTP_STATUS': '200'}
     with open(header_file_path) as f:
         for line in f:
             line = line.strip()

@@ -1,18 +1,20 @@
 import json
+import mimetypes
 import os
 import tempfile
 from datetime import datetime, timedelta
 from typing import Optional
 from urllib.parse import urlparse
-import mimetypes
+import platform
 
 import requests
 from bs4 import BeautifulSoup
 
-from curl_utils import custom_curl_get, read_temp_file, custom_curl_post, custom_curl_headers
+from curl_utils import custom_curl_get, read_temp_file, custom_curl_post, custom_curl_headers, CurlResult, adv_curl_get
 from thread_utils import TaskWrapper
 
-def download_unsecure_file(url, destination_folder, filename, headers=None, task_logger: TaskWrapper = None):
+
+def custom_request_get(url, destination_folder, filename, headers=None, task_logger: TaskWrapper = None):
     """
     Download a file from the given URL and save it to the specified path with the given filename.
 
@@ -61,7 +63,93 @@ def download_unsecure_file(url, destination_folder, filename, headers=None, task
         return False
 
 
-def download_secure_file(url, destination_folder, filename, headers=None, task_logger: TaskWrapper = None):
+def adv_request_get(
+        url,
+        destination_folder,
+        filename,
+        headers=None,
+        task_logger: TaskWrapper = None
+) -> CurlResult:
+    """
+    Download a file from the given URL and save it to the specified path.
+
+    Returns:
+        CurlResult
+    """
+    if headers is None:
+        headers = {}
+
+    try:
+        os.makedirs(destination_folder, exist_ok=True)
+
+        response = requests.get(url, headers=headers)
+
+        http_status = response.status_code
+
+        if http_status == 403:
+            msg = "Not authorized"
+            if task_logger:
+                task_logger.add_log(msg)
+            return CurlResult(
+                success=False,
+                http_status=http_status,
+                return_code=0,
+                stdout="",
+                stderr=msg
+            )
+
+        if http_status == 404:
+            msg = "File not found"
+            if task_logger:
+                task_logger.add_log(msg)
+            return CurlResult(
+                success=False,
+                http_status=http_status,
+                return_code=0,
+                stdout="",
+                stderr=msg
+            )
+
+        response.raise_for_status()
+
+        file_path = os.path.join(destination_folder, filename)
+        with open(file_path, 'wb') as file:
+            file.write(response.content)
+
+        return CurlResult(
+            success=True,
+            http_status=http_status,
+            return_code=0,
+            stdout="",
+            stderr=""
+        )
+
+    except requests.RequestException as e:
+        msg = f"HTTP error: {e}"
+        if task_logger:
+            task_logger.add_log(msg)
+        return CurlResult(
+            success=False,
+            http_status=None,
+            return_code=-1,
+            stdout="",
+            stderr=msg
+        )
+
+    except Exception as e:
+        msg = f"Unexpected error: {e}"
+        if task_logger:
+            task_logger.add_log(msg)
+        return CurlResult(
+            success=False,
+            http_status=None,
+            return_code=-1,
+            stdout="",
+            stderr=msg
+        )
+
+
+def adv_download_file(url, destination_folder, filename, headers=None, task_logger: TaskWrapper = None) -> CurlResult:
     """
     Download a file from the given URL and save it to the specified path with the given filename.
 
@@ -79,11 +167,16 @@ def download_secure_file(url, destination_folder, filename, headers=None, task_l
         # Create destination folder if it doesn't exist
         os.makedirs(destination_folder, exist_ok=True)
         file_path = os.path.join(destination_folder, filename)
-        if custom_curl_get(url, headers, file_path, task_logger):
-            return True
+
+        if platform.system() == 'Linux':
+            return adv_curl_get(url, headers, file_path, task_logger)
+        else:
+            return adv_request_get(url, destination_folder, filename, headers, task_logger)
+
     except Exception as e:
-        task_logger.critical(f'Error downloading file {url}')
-        return False
+        task_logger.set_failure()
+        task_logger.error(str(e))
+        return CurlResult(False, None, -1, '', str(e))
 
 
 def download_secure_text(url, headers=None, task_logger: TaskWrapper = None):
@@ -231,14 +324,17 @@ def get_base_url(url):
     base_url = f"{parsed_url.scheme}://{parsed_url.netloc}/"
     return base_url
 
+
 def get_authority_url(url):
     parsed_url = urlparse(url)
     # Reassemble the base URL with scheme and domain
     base_url = f"{parsed_url.netloc}"
     return base_url
 
+
 def replace_url_ending(url, new_part):
     return "/".join(url.rsplit("/", 1)[:-1]) + "/" + new_part
+
 
 def get_headers_when_empty(headers, url, task_wrapper: TaskWrapper, alt_url: str = None):
     if headers is not None:
@@ -249,6 +345,7 @@ def get_headers_when_empty(headers, url, task_wrapper: TaskWrapper, alt_url: str
         return False
 
     return get_headers(url, True, task_wrapper, False, alt_url)
+
 
 def has_valid_headers():
     file_path = './headers.json'
@@ -264,7 +361,9 @@ def has_valid_headers():
 
     return modified_time >= time_limit
 
-def get_headers(url: str, is_page: bool, task_wrapper: TaskWrapper, test: bool = False, alt_url: str = None, ignore_errors: bool = False) -> \
+
+def get_headers(url: str, is_page: bool, task_wrapper: TaskWrapper, test: bool = False, alt_url: str = None,
+                ignore_errors: bool = False) -> \
         Optional[dict[str, str]]:
     """
     Get the headers from the headers.json file and return them as a dictionary.
@@ -293,7 +392,8 @@ def get_headers(url: str, is_page: bool, task_wrapper: TaskWrapper, test: bool =
             headers = json.load(file)
 
             if is_page:
-                headers["accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+                headers[
+                    "accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
             else:
                 headers["accept"] = "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
             headers["Accept-Encoding"] = "gzip, deflate, br, zstd"

@@ -9,7 +9,7 @@ from datetime import datetime
 import requests
 from flask_sqlalchemy.session import Session
 
-from curl_utils import custom_curl_get
+from curl_utils import custom_curl_get, is_cloudflare_block
 from feature_flags import MANAGE_MEDIA
 from file_utils import is_valid_url, temporary_folder
 from html_utils import get_headers, get_base_url
@@ -52,18 +52,20 @@ class DownloadFilePlugin(ActionMediaFolderPlugin):
         result = super().get_action_args()
 
         result.append(
-            plugin_url_arg('URL', 'url', 'The link to the file to grab.', clear_after="yes", arg1="url")
+            plugin_url_arg('URL', 'url', 'The link to the file to grab.', '', "yes", "url", 'origin', 'Origin')
         )
 
         result.append(
             plugin_filename_arg('Filename', 'filename', 'The name of the file.')
         )
 
-        # result.append(plugin_select_arg('Send Headers', 'headers', 'n', PLUGIN_VALUES_Y_N, 'Send headers with command?'))
-
         result.append(
             plugin_select_arg('Location', 'dest', 'primary',
                               plugin_select_values('Primary Disk', 'primary', 'Archive Disk', 'archive'), '', 'media', adv='Y')
+        )
+
+        result.append(
+            plugin_url_arg('Origin', 'origin', 'The origin for the Url.', '', 'no', "Origin")
         )
 
         if platform.system() != 'Linux':
@@ -82,6 +84,9 @@ class DownloadFilePlugin(ActionMediaFolderPlugin):
 
         if 'url' not in args or args['url'] is None or args['url'] == '':
             results.append('url is required')
+
+        if 'origin' not in args or args['origin'] is None or args['origin'] == '':
+            results.append('origin is required')
 
         if 'filename' not in args or args['filename'] is None or args['filename'] == '':
             results.append('filename is required')
@@ -109,17 +114,18 @@ class DownloadFilePlugin(ActionMediaFolderPlugin):
     def create_task(self, db_session: Session, args):
         filename = args['filename']
         return DownloadFileJob("Download File", f'Downloading {filename} from Web to folder ' + args['folder_id'],
-                               args['folder_id'], filename, args['url'],
-                               args['dest'], args['meth'], self.primary_path,
-                               self.archive_path, self.temp_path)
+                               args['folder_id'], filename, args['url'], args['origin'].strip(), args['dest'],
+                               args['meth'], self.primary_path, self.archive_path, self.temp_path)
 
 
 class DownloadFileJob(TaskWrapper):
-    def __init__(self, name, description, folder_id, filename, url, dest, meth, primary_path, archive_path, temp_path):
+    def __init__(self, name, description, folder_id, filename, url, origin, dest, meth, primary_path, archive_path,
+                 temp_path):
         super().__init__(name, description)
         self.folder_id = folder_id
         self.filename = filename
         self.url = url
+        self.origin = origin
         self.dest = dest
         self.meth = meth
         self.primary_path = primary_path
@@ -128,13 +134,13 @@ class DownloadFileJob(TaskWrapper):
         self.ref_folder_id = folder_id
 
     def get_gcurl_file(self, file_url: str, local_path: str):
-        headers = get_headers(file_url, False, self, False, get_base_url(file_url))
+        headers = get_headers(file_url, False, self, False, self.origin)
         return custom_curl_get(file_url, headers, local_path, self, True)
 
     def get_system_file(self, file_url: str, local_path: str):
         try:
             # Send a GET request to the file URL
-            headers = get_headers(file_url, False, self, False, get_base_url(file_url))
+            headers = get_headers(file_url, False, self, False, self.origin)
             with requests.get(file_url, stream=True, headers=headers) as response:
                 response.raise_for_status()  # Raise an error for HTTP requests with a bad status code
                 # Open the local file in write-binary mode
@@ -161,6 +167,8 @@ class DownloadFileJob(TaskWrapper):
             self.set_failure()
             return
 
+        self.ref_folder_preview = source_row.preview == True
+
         is_archive = self.dest == 'archive'
 
         with temporary_folder(self.temp_path, self) as temp_folder:
@@ -184,6 +192,11 @@ class DownloadFileJob(TaskWrapper):
                 self.set_failure()
 
             if os.path.exists(temp_file) and os.path.isfile(temp_file):
+
+                if is_cloudflare_block(temp_file):
+                    self.error('Cloudflare block detected in downloaded file (403 equivalent)')
+                    self.set_failure()
+                    return
 
                 self.set_worked()
 

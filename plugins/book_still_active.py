@@ -1,5 +1,6 @@
 import argparse
 import platform
+from typing import Optional
 
 from flask_sqlalchemy.session import Session
 
@@ -9,9 +10,17 @@ from plugin_methods import plugin_select_arg
 from plugin_system import ActionBookSpecificPlugin, ActionBookGeneralPlugin
 from plugins.book_update_contents import group_books_by_processor, interleave_books
 from plugins.book_volume_processing import VolumeProcessor
-from text_utils import is_not_blank, is_blank
+from text_utils import is_not_blank
 from thread_utils import TaskWrapper
 from volume_queries import find_book_by_id
+
+
+def processor_for_id(processors, processor_id: str) -> Optional["CustomDownloadInterface"]:
+    for processor in processors:
+        if processor.processor_id == processor_id:
+            return processor
+    return None
+
 
 class CheckAllStatusTask(ActionBookGeneralPlugin):
     """
@@ -88,8 +97,11 @@ class CheckAllStatusTask(ActionBookGeneralPlugin):
 
         for book in interleaved_books:
             if processor == '*' or processor == book.processor:
+                book_processor = processor_for_id(self.processors, book.processor)
+
                 results.append(
-                    CheckBookStatusTask("BookStatus", f'Checking: {book.name}', book.id, self.processors))
+                    CheckBookStatusTask("BookStatus", f'Checking: {book.name}', book.id, book_processor,
+                                        self.processors))
 
         return results
 
@@ -152,18 +164,24 @@ class UpdateSingleStatusTask(ActionBookSpecificPlugin):
         if is_not_blank(book_id):
             book = find_book_by_id(book_id, db_session)
             if book is not None and book.active:
-                return CheckBookStatusTask("Book Status", f'Checking: {book.name}', book.id, self.processors)
+                book_processor = processor_for_id(self.processors, book.processor)
+
+                return CheckBookStatusTask("Book Status", f'Checking: {book.name}', book.id, book_processor,
+                                           self.processors)
 
         return results
 
 
 class CheckBookStatusTask(TaskWrapper):
-    def __init__(self, name, description, book_id, processors, clean_all: bool = False):
+    def __init__(self, name, description, book_id, processor, processors, clean_all: bool = False):
         super().__init__(name, description)
         self.book_id = book_id
         self.processors = processors
+        self.processor = processor
         self.clean_all = clean_all
         self.ref_book_id = book_id
+        if self.processor is not None:
+            self.set_locking_key(self.processor.get_locking_key())
 
     def run(self, db_session: Session):
 

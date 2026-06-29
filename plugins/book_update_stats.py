@@ -7,6 +7,7 @@ from constants import PROPERTY_SERVER_VOLUME_FOLDER
 from date_utils import convert_yyyymmdd_to_date, convert_timestamp_to_datetime
 from feature_flags import MANAGE_VOLUME
 from file_utils import reset_folder
+from filename_utils import renumber_filenames_for_compression, apply_renaming
 from image_utils import resize_image
 from plugin_methods import plugin_select_arg, plugin_select_values
 from plugin_system import ActionBookSpecificPlugin, ActionBookGeneralPlugin
@@ -191,9 +192,15 @@ def generate_db_for_folder(session, item_name, folder_path, task_wrapper: TaskWr
                 if os.path.isdir(chapter_path):
 
                     if task_wrapper.can_trace():
-                        task_wrapper.trace(f'Working on {chapter_path}')
+                        task_wrapper.trace(f'Working on: {chapter_path}')
 
-                    image_file_list = sorted(os.listdir(chapter_path))
+                    new_files, changed = renumber_filenames_for_compression(chapter_path)
+
+                    if changed:
+                        task_wrapper.debug(f'Renamed Files for: {chapter_path}')
+                        apply_renaming(chapter_path, new_files)
+
+                    image_file_list = new_files
 
                     if task_wrapper.can_trace():
                         task_wrapper.trace(f'Sorted')

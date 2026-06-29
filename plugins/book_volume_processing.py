@@ -5,8 +5,8 @@ from typing import Optional
 from flask_sqlalchemy.session import Session
 
 from db import Book
-from file_utils import delete_empty_folders, is_text_file
-from html_utils import download_unsecure_file, download_secure_file, get_headers, get_headers_when_empty
+from file_utils import delete_empty_folders, is_text_file, read_text_file
+from html_utils import adv_download_file, get_headers, get_headers_when_empty
 from image_utils import clean_images_folder, is_valid_image
 from plugins.book_update_stats import generate_db_for_folder
 from processors.processor_core import CustomDownloadInterface
@@ -21,38 +21,45 @@ def _process_file_download(headers_required: bool, task_wrapper: TaskWrapper, im
 
     file_output = os.path.join(destination_folder, image_info['file'])
 
-    while True:
-        if headers_required:
-            if task_wrapper.can_trace():
-                task_wrapper.trace('Secure: ' + image_info['src'])
-            if download_secure_file(
-                    image_info['src'], destination_folder,
-                    image_info['file'], headers, task_wrapper):
-                pass
-            else:
-                task_wrapper.critical('Invalid Secure download, stopping')
-                return "F"
-        else:
-            task_wrapper.trace('Insecure: ' + image_info['src'])
-            if download_unsecure_file(
-                    image_info['src'], destination_folder,
-                    image_info['file'], headers, task_wrapper):
-                pass
-            else:
-                task_wrapper.critical('Invalid Insecure download, stopping')
-                return "F"
+    orig_src = image_info['src']
 
-        if not is_text_file(file_output):
-            return "S"
-        else:
-            task_wrapper.debug("Found Text File, Trying Again")
-            random_sleep(20, 15, task_wrapper)
+    has_alternative = 'alt' in image_info and image_info['alt'] is not None
 
-        try_count = try_count + 1
-        if try_count > 2:
-            task_wrapper.set_failure()
-            task_wrapper.error("Too many failed attempts, failing")
-            return "X"
+    images = [orig_src]
+    if has_alternative:
+        images.append(image_info['alt'])
+    images.append(orig_src)
+    if has_alternative:
+        images.append(image_info['alt'])
+
+    for image_src in images:
+
+        if task_wrapper.can_trace():
+            task_wrapper.trace('Secure: ' + image_src)
+
+        download_response = adv_download_file(image_src, destination_folder, image_info['file'], headers,
+                                              task_wrapper)
+
+        if not download_response.success:
+            task_wrapper.trace(f'Failed to download {image_src} with status {download_response.http_status}')
+        else:
+            # Maybe we had a download, but it isn't right
+            if is_text_file(file_output):
+                txt = read_text_file(file_output)
+
+                if txt is not None:
+                    txt = txt.lower()
+                    if 'www.cloudflare.com' in txt:
+                        return 'CF'
+
+                    task_wrapper.trace("Found Text File, Trying Again")
+                    random_sleep(10, 7, task_wrapper)
+            else:
+                return 'S'
+
+    task_wrapper.set_failure()
+    task_wrapper.critical(f"Too many failed attempts, failing: {orig_src}")
+    return "X"
 
 
 def _process_download(processor, token, book: Book, task_wrapper, book_folder: str, storage_format: str,
@@ -79,9 +86,7 @@ def _process_download(processor, token, book: Book, task_wrapper, book_folder: s
                 regex_list.append(skip_regex)
 
     if headers_required:
-
         headers = get_headers_when_empty(None, site_url, task_wrapper)
-
         if headers is None:
             return False
 
@@ -208,18 +213,26 @@ def _process_download(processor, token, book: Book, task_wrapper, book_folder: s
                 headers['accept'] = 'image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5'
 
             resu = _process_file_download(headers_required, task_wrapper, image_info, destination_folder, headers)
-            if resu == 'X':
-                task_wrapper.error('Failed to download image, skipping item')
-                #stop_download = True
-                #break
-            elif resu == 'E':
-                break
 
             downloaded_images = downloaded_images + 1
             current_image = current_image + 1
+
             task_wrapper.update_percent(100.0 * (current_image / len(image_list)))
+
             modified = True
             random_sleep(delay, min_duration)
+
+            if resu == 'CF':
+                task_wrapper.error('Detected Cloudflare in the response, stopping...')
+                break
+            elif resu == 'F':
+                continue
+            elif resu == 'X':
+                task_wrapper.error('Failed to download image, skipping item')
+                # stop_download = True
+                # break
+            elif resu == 'E':
+                break
 
             if check_image:
                 check_image = False

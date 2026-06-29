@@ -17,7 +17,7 @@ Generic class used to make a Book Processor
 class GenericBasicProcessor(CustomDownloadInterface):
     def __init__(self, processor_id: str, processor_name: str, chapter_query: str, image_query: str,
                  chapter_parser: str,
-                 task_wrapper: TaskWrapper = None, image_method:str = 'default'):
+                 task_wrapper: TaskWrapper = None, image_method:str = 'default', chapter_url_prefix: str = None):
         """
         :type processor_id: str
         :type processor_name: str
@@ -32,6 +32,7 @@ class GenericBasicProcessor(CustomDownloadInterface):
         self.image_query = image_query
         self.chapter_parser = chapter_parser
         self.image_method = image_method
+        self.chapter_url_prefix = chapter_url_prefix
 
     def list_chapters(self, definition: Book, headers=None):
         # Download the webpage
@@ -50,6 +51,9 @@ class GenericBasicProcessor(CustomDownloadInterface):
             href = a['href'].strip()
 
             chapter_name = None
+
+            if self.chapter_url_prefix is not None:
+                href = self.chapter_url_prefix + href
 
             if self.chapter_parser == 'chapter_with_trailing_slash':  # /chapter-23.2
                 cleaned = remove_trailing_slash(href)

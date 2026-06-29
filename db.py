@@ -2,15 +2,37 @@ import datetime
 import uuid
 
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import event, ForeignKey
+from sqlalchemy import event, ForeignKey, Numeric, text, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import object_session, relationship
 from werkzeug.security import generate_password_hash
 
 from feature_flags import MANAGE_APP, MANAGE_PROCESSES, UTILITY_PLUGINS, GENERAL_PLUGINS, VIEW_PROCESSES
+from filename_utils import decompress_filenames, compress_filenames
 
 # Initialize SQLAlchemy
 db = SQLAlchemy()
+
+
+def ensure_column(engine, table_name: str, column_name: str, ddl: str):
+    inspector = inspect(engine)
+    cols = {c["name"] for c in inspector.get_columns(table_name)}
+
+    if column_name not in cols:
+        with engine.begin() as conn:
+            conn.execute(text(ddl))
+
+
+def ensure_schema(engine):
+    ensure_column(
+        engine,
+        "mediafolders",
+        "folder_tag_mask",
+        """
+        ALTER TABLE mediafolders
+        ADD COLUMN folder_tag_mask NUMERIC(38, 0) NOT NULL DEFAULT 0
+        """
+    )
 
 
 # UserGroup model
@@ -82,12 +104,14 @@ class UserLimit(db.Model):
     # Ensure unique limit types per user
     __table_args__ = (db.UniqueConstraint('user_id', 'limit_type', name='user_limit_uc'),)
 
+
 # Association table (no model class needed unless you want extra fields like "added_at")
 book_tags = db.Table(
     'book_tags',
     db.Column('book_id', db.String(128), db.ForeignKey('books.id'), primary_key=True),
     db.Column('tag_id', db.Integer, db.ForeignKey('tags.id'), primary_key=True)
 )
+
 
 # Book model
 class Book(db.Model):
@@ -119,6 +143,7 @@ class Book(db.Model):
     chapters = db.relationship("Chapter", back_populates="book", cascade="all, delete-orphan", lazy=True)
     tags_rel = db.relationship("Tag", secondary=book_tags, back_populates="books", lazy="dynamic")
 
+
 class Tag(db.Model):
     __tablename__ = 'tags'
 
@@ -126,6 +151,7 @@ class Tag(db.Model):
     name = db.Column(db.String(64), unique=True, nullable=False)
 
     books = db.relationship("Book", secondary=book_tags, back_populates="tags_rel")
+
 
 # Chapter model
 class Chapter(db.Model):
@@ -150,7 +176,7 @@ class Chapter(db.Model):
 
     def remove_image(self, image_name):
         # Split the comma-separated image names into a list
-        image_list = self.image_names.split(',')
+        image_list = decompress_filenames(self.image_names)
 
         # Check if the image_name is in the list
         if image_name not in image_list:
@@ -160,7 +186,7 @@ class Chapter(db.Model):
         image_list.remove(image_name)
 
         # Update the image_names by joining the list back into a comma-separated string
-        self.image_names = ','.join(image_list)
+        self.image_names = compress_filenames(image_list)
 
         # Update the page_count based on the remaining images
         self.page_count = len(image_list)
@@ -238,6 +264,13 @@ class MediaFolder(db.Model):
 
     tags = db.Column(db.String(1024), nullable=True)  # Comma-separated list of tags, optional
 
+    # NEW: fast folder filter flags (128-bit mask)
+    folder_tag_mask = db.Column(
+        Numeric(38, 0),
+        nullable=False,
+        default=0
+    )
+
     created = db.Column(db.DateTime(timezone=True), nullable=False,
                         server_default=db.func.now())  # Auto store current UTC time
 
@@ -249,6 +282,37 @@ class MediaFolder(db.Model):
     # Foreign key for optional owning group
     owning_group_id = db.Column(db.Integer, db.ForeignKey('user_groups.id'), nullable=True)
     owning_group = db.relationship("UserGroup", backref="mediafolders")
+
+    def add_folder_tag(self, bit: int):
+        if not 0 <= bit < 128:
+            raise ValueError("Folder tag bit must be 0–127")
+        self.folder_tag_mask |= (1 << bit)
+
+    def remove_folder_tag(self, bit: int):
+        if not 0 <= bit < 128:
+            raise ValueError("Folder tag bit must be 0–127")
+        self.folder_tag_mask &= ~(1 << bit)
+
+    def has_folder_tag(self, bit: int) -> bool:
+        if not 0 <= bit < 128:
+            return False
+        return bool(self.folder_tag_mask & (1 << bit))
+
+
+class MediaFolderTag(db.Model):
+    __tablename__ = 'mediafolder_tags'
+
+    # Bit position (0–127). This is the PRIMARY KEY.
+    bit = db.Column(db.Integer, primary_key=True)
+
+    short_tag = db.Column(db.String(6), nullable=False, unique=True)
+    long_tag = db.Column(db.String(16), nullable=False, unique=True)
+
+    description = db.Column(db.String(255), nullable=True)
+
+    __table_args__ = (
+        db.CheckConstraint('bit >= 0 AND bit < 128', name='ck_mediafoldertag_bit_range'),
+    )
 
 
 @event.listens_for(MediaFolder, 'before_delete')
@@ -309,6 +373,9 @@ def init_db(app):
     db.init_app(app)
     with app.app_context():
         db.create_all()
+
+        # PATCH schema AFTER create_all, BEFORE queries
+        ensure_schema(db.engine)
 
         # Check if any users exist
         if not User.query.first():

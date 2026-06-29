@@ -66,16 +66,16 @@ class UpdateHeaders(ActionBookGeneralPlugin):
         return super().is_ready()
 
     def create_task(self, db_session: Session, args):
-        return UpdateVolumeHeader(args['headers'])
+        return UpdateVolumeHeader(args['headers'], 1)
 
 
 class UpdateVolumeHeader(TaskWrapper):
-    def __init__(self, headers):
+    def __init__(self, headers, override_weight = 100):
         super().__init__('Headers', 'Update headers.json file')
         self.headers = headers
         # This needs to run first
         self.priority = 0
-        self.weight = 100
+        self.weight = override_weight
 
     def run(self, db_session):
         self.info('Writing headers.json file')

@@ -8,6 +8,7 @@ import tempfile
 from contextlib import contextmanager
 from datetime import datetime
 from urllib.parse import urlparse
+import codecs
 
 from thread_utils import TaskWrapper, NoOpTaskWrapper
 
@@ -145,30 +146,20 @@ def is_text_file(file_path, num_bytes=64):
     try:
         with open(file_path, 'rb') as f:
             chunk = f.read(num_bytes)
-        # Try decoding as UTF-8 (strict mode to catch encoding issues)
-        chunk.decode('utf-8')
-        return True  # Successfully decoded as UTF-8, so it's text
-    except (UnicodeDecodeError, FileNotFoundError):
-        pass
 
-    try:
-        with open(file_path, 'rb') as f:
-            chunk = f.read(num_bytes + 1)
-        # Try decoding as UTF-8 (strict mode to catch encoding issues)
-        chunk.decode('utf-8')
-        return True  # Successfully decoded as UTF-8, so it's text
-    except (UnicodeDecodeError, FileNotFoundError):
-        pass
+        decoder = codecs.getincrementaldecoder('utf-8')()
+        decoder.decode(chunk, final=False)
+        return True
 
-    try:
-        with open(file_path, 'rb') as f:
-            chunk = f.read(num_bytes + 2)
-        # Try decoding as UTF-8 (strict mode to catch encoding issues)
-        chunk.decode('utf-8')
-        return True  # Successfully decoded as UTF-8, so it's text
     except (UnicodeDecodeError, FileNotFoundError):
         return False
 
+def read_text_file(file_path):
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except (FileNotFoundError, UnicodeDecodeError):
+        return None
 
 def reset_folder(folder_path):
     # Remove the folder and its contents if it exists

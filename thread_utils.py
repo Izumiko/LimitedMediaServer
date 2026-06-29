@@ -7,7 +7,6 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from queue import PriorityQueue
 from typing import Optional
-import json
 
 def get_caller_info():
     """
@@ -30,6 +29,7 @@ class TaskWorker:
         self.position = 0
         self.job = 0
         self.wait_stamp = 0
+        self.lock_key = None
 
 class TaskManager:
     """
@@ -82,6 +82,28 @@ class TaskManager:
             self.task_queue.get()
         for item in items:
             self.task_queue.put(item)
+
+    def return_task_to_queue(self, task):
+        """
+        Return a previously running task back into the queue.
+        This is used when a processor is not ready to execute.
+        """
+        with self.lock:
+            # Ensure task was actually running
+            if task.task_id not in self.running_tasks:
+                return  # or raise exception if you want strictness
+
+            # Remove from running tasks
+            del self.running_tasks[task.task_id]
+
+            # Recalculate capacity
+            self._update_weights()
+
+            # Move to end of its priority group
+            task.retry_seq += 1
+
+            # Reinsert into queue
+            self.task_queue.put(task)
 
     def get_task_queue(self):
         """
@@ -265,6 +287,7 @@ class TaskWrapper(ABC):
         with TaskWrapper.task_id_lock:
             TaskWrapper.task_id_counter += 1
             self.task_id = TaskWrapper.task_id_counter
+        self.retry_seq = 0
         self.priority = priority
         self.weight = weight
         self.name = name
@@ -287,10 +310,18 @@ class TaskWrapper(ABC):
         self.post_task = None
         self.ref_book_id = ''
         self.ref_folder_id = ''
+        self.ref_folder_preview = False
+        self._lock_key = None
 
     def __lt__(self, other: 'TaskWrapper'):
-        # Compare by priority, then by ID to maintain order
-        return (self.priority, self.task_id) < (other.priority, other.task_id)
+        return (self.priority, self.retry_seq, self.task_id) < (
+            other.priority,
+            other.retry_seq,
+            other.task_id
+        )
+
+    def set_locking_key(self, key):
+        self._lock_key = key
 
     def mark_start(self):
         self.start_time = datetime.now(timezone.utc)
@@ -554,6 +585,9 @@ class TaskWrapper(ABC):
         """
         return self.TRACE >= self.logging_level
 
+    def get_locking_key(self) -> str:
+        return self._lock_key
+
     @abstractmethod
     def run(self, db_session):
         """
@@ -580,6 +614,64 @@ class NoOpTaskWrapper(TaskWrapper):
         :param db_session:
         """
         pass
+
+
+class RunReport(TaskWrapper):
+    """
+    A task whose only purpose is to replay a pre-built list of log messages and
+    set the appropriate status flags.  Useful when job-building logic needs to
+    surface warnings or errors back to the task queue without doing real work.
+
+    Usage:
+        report = RunReport("Import Report", "Tracker import summary")
+        report.add_warn("Group S01E01: no folder found, skipped")
+        report.add_error("Group S01E02: invalid URL, skipped")
+        jobs.append(report)
+    """
+
+    # Severity constants mirror TaskWrapper
+    _WARN = TaskWrapper.WARNING
+    _ERROR = TaskWrapper.ERROR
+
+    def __init__(self, name: str, description: str):
+        super().__init__(name, description)
+        self._entries: list[tuple[int, str]] = []  # (severity, message)
+
+    def add_info(self, message: str) -> 'RunReport':
+        self._entries.append((TaskWrapper.INFO, message))
+        return self
+
+    def add_warn(self, message: str) -> 'RunReport':
+        self._entries.append((TaskWrapper.WARNING, message))
+        return self
+
+    def add_error(self, message: str) -> 'RunReport':
+        self._entries.append((TaskWrapper.ERROR, message))
+        return self
+
+    def has_entries(self) -> bool:
+        return bool(self._entries)
+
+    def run(self, db_session):
+        has_error = False
+        has_warn = False
+
+        for severity, message in self._entries:
+            if severity == TaskWrapper.ERROR:
+                self.error(message)
+                has_error = True
+            elif severity == TaskWrapper.WARNING:
+                self.warn(message)
+                has_warn = True
+            else:
+                self.info(message)
+
+        if has_error:
+            self.set_failure()
+        elif has_warn:
+            self.set_warning()
+        else:
+            self.set_worked()
 
 
 class Token:

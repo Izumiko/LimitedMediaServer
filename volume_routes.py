@@ -14,7 +14,8 @@ from constants import PROPERTY_SERVER_VOLUME_FOLDER, PROPERTY_SERVER_VOLUME_READ
 from date_utils import convert_date_to_yyyymmdd, convert_datetime_to_yyyymmdd
 from db import db, Book
 from feature_flags import BOOKMARKS, VIEW_BOOKS, MANAGE_VOLUME
-from image_utils import split_and_save_image, merge_two_images
+from filename_utils import decompress_filenames
+from image_utils import split_and_save_image, merge_two_images, resize_image
 from messages import msg_action_cancelled_wrong, msg_missing_parameter, msg_invalid_parameter, \
     msg_access_denied_content_rating, msg_operation_complete, msg_action_failed, msg_server_error, msg_book_added, \
     msg_book_removed
@@ -23,7 +24,7 @@ from text_utils import is_blank, clean_string, is_valid_book_id, is_not_blank
 from volume_queries import list_books_for_rating, find_chapters_by_book, find_book_by_id, find_chapter_by_id, \
     find_chapter_by_sequence, upsert_book, upsert_recent, \
     find_bookmarks, add_volume_bookmark, remove_volume_bookmark, \
-    count_books_for_rating, find_recent_entries, manage_remove_book, find_tags
+    count_books_for_rating, find_recent_entries, manage_remove_book, find_tags, search_tags
 from volume_utils import get_volume_max_rating
 
 volume_blueprint = Blueprint('volume', __name__)
@@ -194,7 +195,7 @@ def get_chapters(user_details: dict) -> tuple:
 
     style = 'scroll' if book.style == 'S' else 'page'
 
-    return generate_success_response('', {'chapters': chapter_results, 'style': style, 'info_url': info_url})
+    return generate_success_response('', {'chapters': chapter_results, 'name': book.name, 'style': style, 'info_url': info_url})
 
 
 @volume_blueprint.route('/list/tags', methods=['POST'])
@@ -208,6 +209,7 @@ def get_tags(user_details: dict) -> tuple:
         tags.append(tag.name)
 
     return generate_success_response('', {'tags': tags})
+
 
 
 @volume_blueprint.route('/list/images', methods=['POST'])
@@ -257,7 +259,7 @@ def get_images(user_details: dict) -> tuple:
     prev_chapter_record = find_chapter_by_sequence(book_id, current_chapter.sequence - 1)
     next_chapter_record = find_chapter_by_sequence(book_id, current_chapter.sequence + 1)
 
-    files = current_chapter.image_names.split(',') if current_chapter.image_names else []
+    files = decompress_filenames(current_chapter.image_names) if current_chapter.image_names else []
     prev_chapter_id = prev_chapter_record.chapter_id if prev_chapter_record else ''
     next_chapter_id = next_chapter_record.chapter_id if next_chapter_record else ''
 
@@ -357,12 +359,27 @@ def remove_image(user_details):
     if chapter_row is None:
         return generate_failure_response('Could not find chapter', messages=[msg_action_cancelled_wrong()])
 
+    current_images = decompress_filenames(chapter_row.image_names) if chapter_row.image_names else []
+    was_first = len(current_images) > 0 and current_images[0] == file_name
+
     if chapter_row.remove_image(file_name):
         file_path = os.path.join(current_app.config[PROPERTY_SERVER_VOLUME_FOLDER], book_id, chapter_id, file_name)
         if os.path.exists(file_path) and os.path.isfile(file_path):
             os.unlink(file_path)
             if not os.path.exists(file_path):
                 db.session.commit()
+
+                if was_first:
+                    updated_images = decompress_filenames(chapter_row.image_names) if chapter_row.image_names else []
+                    if updated_images:
+                        new_first_path = os.path.join(current_app.config[PROPERTY_SERVER_VOLUME_FOLDER], book_id, chapter_id, updated_images[0])
+                        preview_path = os.path.join(current_app.config[PROPERTY_SERVER_VOLUME_FOLDER], book_id, '.previews', chapter_id + '.webp')
+                        if os.path.exists(new_first_path):
+                            try:
+                                resize_image(new_first_path, preview_path, 200, 'WEBP')
+                            except Exception as e:
+                                logging.error(f'Could not regenerate chapter thumbnail: {e}')
+
                 return generate_success_response('Image removed', messages=[msg_operation_complete()])
             else:
                 db.session.rollback()
@@ -943,6 +960,50 @@ def update_book(user_details: dict) -> tuple:
         return generate_failure_response(f'Error updating book: {str(e)}', messages=[msg_action_failed()])
 
     return generate_success_response('Book updated successfully', messages=[msg_operation_complete()])
+
+
+@volume_blueprint.route('/guess/tags', methods=['POST'])
+@feature_required(volume_blueprint, VIEW_BOOKS)
+def guess_tags(user_details: dict) -> tuple:
+    if not current_app.config[PROPERTY_SERVER_VOLUME_READY]:
+        return generate_failure_response('Volume service not ready', 400, messages=[msg_server_error()])
+
+    values = clean_string(request.form.get('values'))
+    if is_blank(values):
+        return generate_failure_response('values parameter is required', messages=[msg_missing_parameter('values')])
+
+    words = [w.upper() for w in values.split() if w.strip()]
+    matched_tags = []
+    
+    i = 0
+    while i < len(words):
+        best_match = None
+        
+        # Try extending the sequence of words to find an exact tag match
+        for j in range(i, min(i + 6, len(words))):
+            candidate = ' '.join(words[i:j+1])
+            matching_tags = search_tags(candidate)
+            
+            # Check for exact equality among matches
+            for tag in matching_tags:
+                if tag.name == candidate:
+                    best_match = candidate
+                    break
+            
+            if best_match:
+                break
+        
+        if best_match:
+            # Consume all words that were part of the matched tag
+            word_count = len(best_match.split())
+            matched_tags.append(best_match)
+            i += word_count
+        else:
+            # No match found - this word is a new tag (unmatched)
+            matched_tags.append(words[i])
+            i += 1
+
+    return generate_success_response('', {'tags': matched_tags})
 
 
 @volume_blueprint.route('/remove', methods=['POST'])

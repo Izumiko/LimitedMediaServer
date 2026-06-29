@@ -145,7 +145,7 @@ def encode_video(
             if input_format is not None:
                 payload['input_format'] = input_format
 
-            response = requests.post(f"{server_url}/encode/start", files=files, data={"options": json.dumps(payload)}, timeout=15)
+            response = requests.post(f"{server_url}/encode/start", files=files, data={"options": json.dumps(payload)}, timeout=180)
             for f in files.values():
                 f.close()
 
@@ -159,19 +159,21 @@ def encode_video(
                 log.warn("No ticket_id in response; falling back to local encoding.")
                 return _run_local_encode()
 
-            # Poll every 30s
+            # Poll every 12s
             while True:
-                time.sleep(30)
-                status_resp = requests.get(f"{server_url}/encode/status/{ticket_id}", timeout=10)
+                time.sleep(12)
+                status_resp = requests.get(f"{server_url}/encode/status/{ticket_id}", timeout=180)
                 if status_resp.status_code != 200:
                     log.warn("Status check failed; falling back to local.")
                     return _run_local_encode()
-
-                status = status_resp.json().get("status")
+                data_payload = status_resp.json()
+                status = data_payload.get("status")
+                progress = data_payload.get("progress")
                 log.info(f"Ticket {ticket_id} status: {status}")
                 if status == "done":
+                    log.update_percent(100)
                     # Retrieve file
-                    result = requests.get(f"{server_url}/encode/result/{ticket_id}", timeout=60)
+                    result = requests.get(f"{server_url}/encode/result/{ticket_id}", timeout=180)
                     if result.status_code == 200:
                         with open(output_path, "wb") as f:
                             f.write(result.content)
@@ -183,6 +185,9 @@ def encode_video(
                 elif status == "failed":
                     log.error("Remote encoding failed; falling back to local.")
                     return _run_local_encode()
+                elif progress:
+                   log.update_percent(float(progress))
+
                 # otherwise, "queued" or "processing" — continue waiting
 
         except Exception as e:

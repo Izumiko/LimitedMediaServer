@@ -9,7 +9,7 @@ from sqlalchemy.engine.reflection import Inspector
 
 from app_queries import get_volume_folder
 from db import db, UserGroup, User, Book, MediaFolder, MediaFileProgress, VolumeProgress, AppProperties, UserLimit, \
-    UserHardSession, MediaFile, VolumeBookmark
+    UserHardSession, MediaFile, VolumeBookmark, MediaFolderTag
 from plugins.book_update_stats import generate_book_definitions
 from text_utils import is_not_blank
 from thread_utils import TaskWrapper
@@ -319,6 +319,9 @@ def backup_media_folders_and_files(output_folder, db_session: Session, user_grou
                        "last_date": row.last_date.isoformat(),
                        "active": row.active}
 
+            if row.folder_tag_mask > 0:
+                new_row['folder_tag_mask'] = row.folder_tag_mask
+
             if row.preview:
                 new_row['preview'] = row.preview
 
@@ -360,6 +363,41 @@ def backup_media_folders_and_files(output_folder, db_session: Session, user_grou
     tw.debug(f'Wrote {count_files} File Records')
 
 
+def backup_media_folder_tags(output_folder, db_session: Session, tw: TaskWrapper):
+    rows = db_session.query(MediaFolderTag).all()
+    file_path = os.path.join(output_folder, f"folder_tags.json")
+    count = 0
+    with open(file_path, "w") as file:
+        for row in rows:
+            new_row = {"bit": row.bit, "short": row.short_tag, "long": row.long_tag,
+                       "description": row.description if row.description else ""}
+            dumped_row = json.dumps(new_row)
+            file.write(dumped_row + "\n")
+            count += 1
+    tw.debug(f'Wrote {count} Media Folder Tag Records')
+
+
+def restore_media_folder_tag(restore_path: str, db_session: Session, tw: TaskWrapper):
+    file_path = os.path.join(restore_path, "folder_tags.json")
+    count = 0
+    with open(file_path, "r") as file:
+        for line in file:
+            row = json.loads(line.strip())
+            # Check the required properties
+            if 'bit' in row and 'short' in row and 'long' in row:
+                description = None
+                if 'description' in row:
+                    description = row['description']
+                entry_item = MediaFolderTag(bit=row['bit'], short_tag=row['short'], long_tag=row['long'],
+                                            description=description)
+                db_session.add(entry_item)
+                db_session.commit()
+
+                count += 1
+
+    tw.debug(f'Added {count} Media Folder Tag Records')
+
+
 def restore_media_folders_and_files(restore_path: str, db_session: Session, user_groups: dict[str, int],
                                     tw: TaskWrapper):
     file_path = os.path.join(restore_path, "folders.json")
@@ -384,10 +422,13 @@ def restore_media_folders_and_files(restore_path: str, db_session: Session, user
                 group = None
                 if '@group' in row:
                     group = user_groups[row['@group']]
+                folder_tag_mask = 0
+                if 'folder_tag_mask' in row:
+                    folder_tag_mask = row['folder_tag_mask']
 
                 entry_item = MediaFolder(id=row['id'], name=row['name'], rating=row['rating'], preview=preview,
                                          parent_id=parent_id, info_url=info_url, active=row['active'],
-                                         tags=tags, created=datetime.fromisoformat(row['created']),
+                                         tags=tags, folder_tag_mask=folder_tag_mask, created=datetime.fromisoformat(row['created']),
                                          last_date=date.fromisoformat(row['last_date']),
                                          owning_group_id=group)
 
@@ -588,6 +629,10 @@ def perform_backup(output_folder, db_session: Session, tw: TaskWrapper):
     backup_media_folders_and_files(output_folder, db_session, user_group_lookup, tw)
     tw.info('Saved Media Folders and Files')
 
+    tw.trace('Starting to save Media Folder Tags')
+    backup_media_folder_tags(output_folder, db_session, tw)
+    tw.info('Saved Media Folder Tags')
+
     # Media Progress
     tw.trace('Starting to save Media Progress')
     backup_media_progress(output_folder, db_session, user_lookup, tw)
@@ -639,6 +684,10 @@ def perform_restore(restore_path: str, tw: TaskWrapper):
     tw.trace('Starting to Restore Media Folders and Files')
     restore_media_folders_and_files(restore_path, db_session, user_groups, tw)
     tw.info('Restored Media Folders and Files')
+
+    tw.trace('Starting to Restore Media Folder Tags')
+    restore_media_folder_tag(restore_path, db_session, tw)
+    tw.info('Restored Media Folder Tags')
 
     tw.trace('Starting to Restore Media Progress')
     restore_media_progress(restore_path, db_session, users, tw)

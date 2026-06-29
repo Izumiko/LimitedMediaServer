@@ -14,13 +14,15 @@ from db import MediaFile, MediaFolder
 from feature_flags import MANAGE_MEDIA
 from ffmpeg_utils import FFMPEG_PRESET, FFMPEG_PRESET_VALUES, FFMPEG_CRF, FFMPEG_CRF_VALUES, \
     get_ffmpeg_f_argument_from_mimetype, FFMPEG_AUDIO_BIT, FFMPEG_AUDIO_BIT_RATE_VALUES, \
-    FFMPEG_STEREO, FFMPEG_STEREO_VALUES, encode_video
+    FFMPEG_STEREO, FFMPEG_STEREO_VALUES, encode_video, generate_video_thumbnail
 from file_utils import temporary_folder
+from image_utils import resize_image
 from media_queries import insert_file, find_file_by_filename, find_files_in_folder
 from media_utils import get_data_for_mediafile, \
-    get_filename_with_extension, convert_vtt_to_srt, get_folder_by_user, get_file_by_user, describe_file_size_change
+    get_filename_with_extension, convert_vtt_to_srt, get_folder_by_user, get_file_by_user, describe_file_size_change, \
+    get_preview_for_mediafile, clean_files_for_mediafile
 from number_utils import is_integer_with_sign
-from plugin_methods import plugin_string_arg
+from plugin_methods import plugin_string_arg, plugin_select_arg, plugin_select_values
 from plugin_system import ActionMediaFilePlugin, ActionMediaFolderPlugin, ActionMediaFilesPlugin
 from text_utils import is_not_blank, is_blank, clean_string
 from thread_utils import TaskWrapper
@@ -66,10 +68,23 @@ class SubtitleForFilePlugin(ActionMediaFilePlugin):
         result = super().get_action_args()
 
         result.append(plugin_string_arg('Offset', 'offset', 'Subtitle Offset in seconds'))
+        result.append(plugin_string_arg('Postfix', 'postfix', 'Suffix added before the extension (default: _sub)'))
         result.append(FFMPEG_PRESET)
         result.append(FFMPEG_CRF)
         result.append(FFMPEG_AUDIO_BIT)
         result.append(FFMPEG_STEREO)
+
+        result.append(
+            plugin_select_arg('Location', 'dest', 'primary',
+                              plugin_select_values('Primary Disk', 'primary', 'Archive Disk', 'archive'), '', 'media',
+                              adv='Y')
+        )
+
+        result.append(
+            plugin_select_arg('Clean Up', 'cleanup', 'keep',
+                              plugin_select_values('Keep', 'keep', 'Purge', 'purge', 'Rename', 'rename'),
+                              'What to do with the source files after a successful encode.', adv='Y')
+        )
 
         return result
 
@@ -116,6 +131,23 @@ class SubtitleForFilePlugin(ActionMediaFilePlugin):
             if not is_integer_with_sign(args['offset']):
                 results.append('offset is not a valid integer')
 
+        if 'postfix' not in args or is_blank(args['postfix']):
+            args['postfix'] = '_sub'
+        else:
+            args['postfix'] = clean_string(args['postfix'])
+
+        if 'dest' not in args or is_blank(args['dest']):
+            results.append('dest is required')
+        elif not (args['dest'] == 'primary' or args['dest'] == 'archive'):
+            results.append('Invalid dest value')
+
+        if 'cleanup' not in args or is_blank(args['cleanup']):
+            args['cleanup'] = 'keep'
+        else:
+            args['cleanup'] = clean_string(args['cleanup'])
+            if args['cleanup'] not in ('keep', 'purge', 'rename'):
+                results.append('Invalid cleanup value')
+
         if len(results) > 0:
             return results
         return None
@@ -128,7 +160,8 @@ class SubtitleForFilePlugin(ActionMediaFilePlugin):
                                  args['ffmpeg_preset'], args['ffmpeg_crf'], self.primary_path, self.archive_path,
                                  self.temp_path, int(args['ffmpeg_abr']), args['ffmpeg_mix'] == 't',
                                  int(args['offset']), encoder_host=self.media_encoder_host,
-                                 encoder_port=self.media_encoder_port)
+                                 encoder_port=self.media_encoder_port, dest=args['dest'],
+                                 postfix=args['postfix'], cleanup=args['cleanup'])
 
 
 class SubtitleForFilesPlugin(ActionMediaFilesPlugin):
@@ -171,10 +204,23 @@ class SubtitleForFilesPlugin(ActionMediaFilesPlugin):
         result = super().get_action_args()
 
         result.append(plugin_string_arg('Offset', 'offset', 'Subtitle Offset in seconds'))
+        result.append(plugin_string_arg('Postfix', 'postfix', 'Suffix added before the extension (default: _sub)'))
         result.append(FFMPEG_PRESET)
         result.append(FFMPEG_CRF)
         result.append(FFMPEG_AUDIO_BIT)
         result.append(FFMPEG_STEREO)
+
+        result.append(
+            plugin_select_arg('Location', 'dest', 'primary',
+                              plugin_select_values('Primary Disk', 'primary', 'Archive Disk', 'archive'), '', 'media',
+                              adv='Y')
+        )
+
+        result.append(
+            plugin_select_arg('Clean Up', 'cleanup', 'keep',
+                              plugin_select_values('Keep', 'keep', 'Purge', 'purge', 'Rename', 'rename'),
+                              'What to do with the source files after a successful encode.', adv='Y')
+        )
 
         return result
 
@@ -221,6 +267,23 @@ class SubtitleForFilesPlugin(ActionMediaFilesPlugin):
             if not is_integer_with_sign(args['offset']):
                 results.append('offset is not a valid integer')
 
+        if 'postfix' not in args or is_blank(args['postfix']):
+            args['postfix'] = '_sub'
+        else:
+            args['postfix'] = clean_string(args['postfix'])
+
+        if 'dest' not in args or is_blank(args['dest']):
+            results.append('dest is required')
+        elif not (args['dest'] == 'primary' or args['dest'] == 'archive'):
+            results.append('Invalid dest value')
+
+        if 'cleanup' not in args or is_blank(args['cleanup']):
+            args['cleanup'] = 'keep'
+        else:
+            args['cleanup'] = clean_string(args['cleanup'])
+            if args['cleanup'] not in ('keep', 'purge', 'rename'):
+                results.append('Invalid cleanup value')
+
         if len(results) > 0:
             return results
         return None
@@ -239,7 +302,8 @@ class SubtitleForFilesPlugin(ActionMediaFilesPlugin):
                                  args['ffmpeg_preset'], args['ffmpeg_crf'], self.primary_path, self.archive_path,
                                  self.temp_path, int(args['ffmpeg_abr']), args['ffmpeg_mix'] == 't',
                                  int(args['offset']), encoder_host=self.media_encoder_host,
-                                 encoder_port=self.media_encoder_port))
+                                 encoder_port=self.media_encoder_port, dest=args['dest'],
+                                 postfix=args['postfix'], cleanup=args['cleanup']))
 
         return result
 
@@ -288,6 +352,20 @@ class SubtitleForFolderPlugin(ActionMediaFolderPlugin):
         result.append(FFMPEG_AUDIO_BIT)
         result.append(FFMPEG_STEREO)
 
+        result.append(plugin_string_arg('Postfix', 'postfix', 'Suffix added before the extension (default: _sub)'))
+
+        result.append(
+            plugin_select_arg('Location', 'dest', 'primary',
+                              plugin_select_values('Primary Disk', 'primary', 'Archive Disk', 'archive'), '', 'media',
+                              adv='Y')
+        )
+
+        result.append(
+            plugin_select_arg('Clean Up', 'cleanup', 'keep',
+                              plugin_select_values('Keep', 'keep', 'Purge', 'purge', 'Rename', 'rename'),
+                              'What to do with the source files after a successful encode.', adv='Y')
+        )
+
         return result
 
     def process_action_args(self, args):
@@ -325,6 +403,23 @@ class SubtitleForFolderPlugin(ActionMediaFolderPlugin):
             if args['ffmpeg_mix'] not in FFMPEG_STEREO_VALUES:
                 results.append('unknown ffmpeg_mix value')
 
+        if 'postfix' not in args or is_blank(args['postfix']):
+            args['postfix'] = '_sub'
+        else:
+            args['postfix'] = clean_string(args['postfix'])
+
+        if 'dest' not in args or is_blank(args['dest']):
+            results.append('dest is required')
+        elif not (args['dest'] == 'primary' or args['dest'] == 'archive'):
+            results.append('Invalid dest value')
+
+        if 'cleanup' not in args or is_blank(args['cleanup']):
+            args['cleanup'] = 'keep'
+        else:
+            args['cleanup'] = clean_string(args['cleanup'])
+            if args['cleanup'] not in ('keep', 'purge', 'rename'):
+                results.append('Invalid cleanup value')
+
         if len(results) > 0:
             return results
         return None
@@ -336,14 +431,16 @@ class SubtitleForFolderPlugin(ActionMediaFolderPlugin):
         return SubtitleEncodeJob("SubtitleFolder", 'Encoding: ' + args['folder_id'], None, args['folder_id'],
                                  args['ffmpeg_preset'], args['ffmpeg_crf'], self.primary_path, self.archive_path,
                                  self.temp_path, int(args['ffmpeg_abr']), args['ffmpeg_mix'] == 't',
-                                 encoder_host=self.media_encoder_host, encoder_port=self.media_encoder_port)
+                                 encoder_host=self.media_encoder_host, encoder_port=self.media_encoder_port,
+                                 dest=args['dest'], postfix=args['postfix'], cleanup=args['cleanup'])
 
 
 class SubtitleEncodeJob(TaskWrapper):
     def __init__(self, name, description, file_id: Optional[str], folder_id: Optional[str], ffmpeg_preset: str,
                  ffmpeg_crf: str, primary_folder: str, archive_folder: str, temp_folder: str, audio_bit_rate: int = 128,
                  stereo: bool = True, offset: int = 0, encoder_host: str | None = None,
-                 encoder_port: int | None = 8080):
+                 encoder_port: int | None = 8080, dest: str | None = 'primary', postfix: str = '_sub',
+                 cleanup: str = 'keep'):
         super().__init__(name, description)
         self.file_id = file_id
         self.folder_id = folder_id
@@ -352,6 +449,9 @@ class SubtitleEncodeJob(TaskWrapper):
         self.temp_folder = temp_folder
         self.ffmpeg_preset = ffmpeg_preset
         self.ffmpeg_crf = int(ffmpeg_crf)
+        self.dest = dest
+        self.postfix = postfix
+        self.cleanup = cleanup
         self.weight = 70
         if encoder_host is not None and len(encoder_host) > 0:
             self.weight = 10
@@ -381,6 +481,28 @@ class SubtitleEncodeJob(TaskWrapper):
             else:
                 return srt_file
 
+    def find_subtitle_row(self, folder: MediaFolder, file: MediaFile, db_session: Session) -> Optional[MediaFile]:
+        srt_row = find_file_by_filename(get_filename_with_extension(file.filename, 'srt'), folder.id, db_session)
+        if srt_row is not None:
+            return srt_row
+        return find_file_by_filename(get_filename_with_extension(file.filename, 'vtt'), folder.id, db_session)
+
+    def _apply_cleanup(self, file: MediaFile, db_session: Session):
+        if self.cleanup == 'keep':
+            return
+        try:
+            if self.cleanup == 'purge':
+                clean_files_for_mediafile(file, self.primary_folder, self.archive_folder)
+                db_session.delete(file)
+                self.info(f'Purged source file: {file.filename}')
+            elif self.cleanup == 'rename':
+                stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                file.filename = f'{stamp}_{file.filename}'
+                self.info(f'Renamed source record to: {file.filename}')
+        except OSError as e:
+            self.warn(f'Clean up failed for {file.filename}: {e}')
+
+
     def run(self, db_session: Session):
 
         # Sanity Check
@@ -391,6 +513,8 @@ class SubtitleEncodeJob(TaskWrapper):
 
         folder_row = None
 
+        is_archive = self.dest is not None and self.dest == 'archive'
+
         if self.folder_id is not None:
             try:
                 if self.can_trace():
@@ -399,6 +523,7 @@ class SubtitleEncodeJob(TaskWrapper):
                 if self.can_trace():
                     self.trace('Getting Files')
                 self.ref_folder_id = folder_row.id
+                self.ref_folder_preview = folder_row.preview == True
                 files = find_files_in_folder(folder_row.id, None, 0, 1000, db_session=db_session)
                 for file in files:
                     if file.mime_type.startswith('video/'):
@@ -421,6 +546,7 @@ class SubtitleEncodeJob(TaskWrapper):
                 if file_row.mime_type.startswith('video/'):
                     to_process.append(file_row)
                     self.ref_folder_id = folder_row.id
+                    self.ref_folder_preview = folder_row.preview == True
                 else:
                     self.error(f'Given file mime-type {file_row.mime_type} is not a video')
 
@@ -487,12 +613,14 @@ class SubtitleEncodeJob(TaskWrapper):
 
                         src_path = Path(temp_folder) / 'temp.mp4'
 
-                        file_name = file.filename + '_subtitled'
+                        base, ext = os.path.splitext(file.filename)
+                        if not ext:
+                            file_name = file.filename + '.mp4'
+                        else:
+                            file_name = base + self.postfix + ext
                         file_size = src_path.stat().st_size
                         created_time = datetime.fromtimestamp(src_path.stat().st_ctime)
                         mime_type, _ = mimetypes.guess_type(src_path)
-
-                        is_archive = False
 
                         # Try to insert the object
                         new_file = insert_file(folder_row.id, file_name, mime_type, is_archive, False, file_size,
@@ -513,6 +641,27 @@ class SubtitleEncodeJob(TaskWrapper):
                         self.info(describe_file_size_change(file.filesize, new_file.filesize))
 
                         shutil.move(str(src_path), str(dest_path))
+
+                        self._apply_cleanup(file, db_session)
+                        sub_row = self.find_subtitle_row(folder_row, file, db_session)
+                        if sub_row is not None:
+                            self._apply_cleanup(sub_row, db_session)
+                        db_session.commit()
+
+                        self.trace('Finding Preview')
+                        preview_path = get_preview_for_mediafile(new_file, self.primary_folder)
+
+                        try:
+                            generate_video_thumbnail(dest_path, 'mp4', preview_path, 40)
+                            if os.path.exists(preview_path):
+                                resize_image(preview_path, preview_path, 256, 'WEBP')
+                                new_file.preview = True
+                                db_session.commit()
+                            else:
+                                self.warn("Could not find preview")
+                        except Exception as e:
+                            logging.exception(e)
+                            self.set_failure()
 
                         self.set_worked()
                     else:

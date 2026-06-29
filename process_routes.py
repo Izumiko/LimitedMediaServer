@@ -15,6 +15,7 @@ from common_utils import generate_failure_response, generate_success_response
 from constants import MAX_WORKERS
 from db import db
 from feature_flags import MANAGE_PROCESSES, VIEW_PROCESSES, MANAGE_APP
+from key_lock_manager import KeyLockManager
 from messages import msg_invalid_parameter, msg_tasks_started, msg_action_cancelled_duplicate_task, \
     msg_missing_parameter, msg_action_failed, msg_operation_complete, msg_action_failed_missing, msg_removed_x_items, \
     msg_found_x_results, msg_access_denied_content_rating, msg_found_x_results_removed_y, msg_auth_feature_required
@@ -28,9 +29,11 @@ process_blueprint = Blueprint('process', __name__)
 global task_manager, worker_queue_number
 task_manager = TaskManager()
 
+# One instance
+key_lock_manager = KeyLockManager()
+
 # Initialize ThreadPoolExecutor with a maximum # of worker threads
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-
 
 def close_queue_session(my_task_manager: TaskManager, task_wrapper: TaskWrapper, session: Session,
                         worker_status: TaskWorker):
@@ -64,6 +67,15 @@ def queue_worker(my_task_manager: TaskManager, app, index: int):
             worker_status.position = 2
             time.sleep(3)
             continue  # Sentinel to exit
+
+        lock_key = task_wrapper.get_locking_key()
+
+        if not key_lock_manager.acquire(lock_key):
+            task_wrapper.trace('Waiting')
+            my_task_manager.return_task_to_queue(task_wrapper)
+            time.sleep(3)
+            continue
+
         worker_status.job = task_wrapper.task_id
         session = None
         try:
@@ -97,6 +109,7 @@ def queue_worker(my_task_manager: TaskManager, app, index: int):
             task_wrapper.error(
                 'Exception: ' + ex_json['message'] + ' - ' + ex_json['file'] + '[' + ex_json['line'] + ']')
         finally:
+            key_lock_manager.release(lock_key)
             worker_status.position = 70
             close_queue_session(my_task_manager, task_wrapper, session, worker_status)
             worker_status.position = 72
@@ -166,6 +179,7 @@ def add_plugin_task(user_details):
                     return generate_failure_response("User is not allowed to use the specified plugin", 401,
                                                      messages=[msg_access_denied_content_rating()])
 
+                task_args['_user_details'] = user_details
                 error_list = plugin.process_action_args(task_args)
                 if error_list is None:
 
@@ -268,7 +282,7 @@ def restart_service(user_details):
 @process_blueprint.route('/status/all', methods=['POST'])
 @feature_required(process_blueprint, VIEW_PROCESSES)
 def get_all_task_status(user_detail):
-    get_all_task_status_extra_method(user_detail, '')
+    return get_all_task_status_extra_method(user_detail, '')
 
 
 @process_blueprint.route('/status/all/with/<extra_method_call>', methods=['POST'])
@@ -304,9 +318,12 @@ def get_all_task_status_extra_method(user_detail, extra_method_call):
                 init_processor(app)
 
     removed_tasks = 0
+    active_only = False
 
     if is_blank(extra_method_call) or extra_method_call == 'NONE':
         pass
+    elif extra_method_call == 'ACTIVE':
+        active_only = True
     else:
         if get_user_features(user_detail) & MANAGE_PROCESSES != MANAGE_PROCESSES:
             return generate_failure_response('Not allowed to use this method', 401, msg_auth_feature_required())
@@ -349,6 +366,10 @@ def get_all_task_status_extra_method(user_detail, extra_method_call):
     for task in tasks[start:end]:
         if not task:
             break
+
+        if active_only and (task.is_finished or task.is_waiting):
+            continue
+
         result.append({
             "id": task.task_id,
             "name": task.name,
@@ -361,7 +382,7 @@ def get_all_task_status_extra_method(user_detail, extra_method_call):
             "warning": task.is_warning,
             "worked": task.is_worked,
             "logging": task.logging_level,
-            "log": task.log_entries,
+            "log": task.log_entries[-2:],
             "delay_duration": task.duration_delayed,
             "running_duration": task.duration_running,
             "total_duration": task.duration_total,
@@ -370,6 +391,7 @@ def get_all_task_status_extra_method(user_detail, extra_method_call):
             "end_timestamp": task.end_timestamp,
             "book_id": task.ref_book_id,
             "folder_id": task.ref_folder_id,
+            "folder_img": task.ref_folder_preview,
             "priority": task.priority,
             "weight": task.weight
         })

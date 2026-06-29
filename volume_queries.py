@@ -9,6 +9,7 @@ from sqlalchemy.orm import aliased
 
 from date_utils import convert_yyyymmdd_to_date
 from db import Book, Chapter, VolumeProgress, VolumeBookmark, db, Tag
+from filename_utils import compress_filenames
 from text_utils import is_not_blank
 from thread_utils import TaskWrapper
 
@@ -131,6 +132,21 @@ def find_tags() -> Optional[List[Tag]]:
     """
 
     return Tag.query.order_by(Tag.name).all()
+
+
+def search_tags(prefix: str) -> Optional[List[Tag]]:
+    """
+    Find all tags whose name starts with the given prefix.
+    Prefix is converted to uppercase for case-insensitive matching.
+    :param prefix: The tag name prefix to search for.
+    :return: List of matching Tag objects ordered by name, or empty list.
+    """
+    if not prefix:
+        return find_tags()
+    uppercase_prefix = prefix.upper().strip()
+    if not uppercase_prefix:
+        return find_tags()
+    return Tag.query.filter(Tag.name.startswith(uppercase_prefix)).order_by(Tag.name).all()
 
 
 def find_chapters_by_book(book_id: str, uid: int) -> Optional[List[tuple[Chapter, VolumeProgress]]]:
@@ -552,7 +568,7 @@ def manage_book_chapters(book_id: str, chapters, logger: TaskWrapper = None, db_
     for chapter in chapters:
         chapter_name = chapter['name']
         page_count = len(chapter['files'])
-        pages = ','.join(chapter['files'])
+        pages_encoded = compress_filenames(chapter['files'])
         chapter_date = convert_yyyymmdd_to_date(chapter['date'])
 
         if logger is not None and logger.can_trace():
@@ -562,10 +578,10 @@ def manage_book_chapters(book_id: str, chapters, logger: TaskWrapper = None, db_
             exiting_chapter = existing_lookup[chapter_name]
             del existing_lookup[chapter_name]
 
-            if exiting_chapter.sequence != sequence_number or exiting_chapter.page_count != page_count or exiting_chapter.image_names != pages or exiting_chapter.date != chapter_date:
+            if exiting_chapter.sequence != sequence_number or exiting_chapter.page_count != page_count or exiting_chapter.image_names != pages_encoded or exiting_chapter.date != chapter_date:
                 exiting_chapter.sequence = sequence_number
                 exiting_chapter.page_count = page_count
-                exiting_chapter.image_names = pages
+                exiting_chapter.image_names = pages_encoded
                 db_session.commit()
 
                 if logger is not None and logger.can_debug():
@@ -579,7 +595,7 @@ def manage_book_chapters(book_id: str, chapters, logger: TaskWrapper = None, db_
                 book_id=book_id,
                 chapter_id=chapter_name,
                 page_count=page_count,
-                image_names=pages,
+                image_names=pages_encoded,
                 sequence=sequence_number,
                 date=chapter_date
             )
