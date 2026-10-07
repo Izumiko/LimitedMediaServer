@@ -13,7 +13,7 @@ def generate_failure_response(message, status_code=400, extra_data=None, message
     :param messages: Optional translated messages to display
     :return: JSON response with failure status and message.
     """
-    response = {'status': 'FAIL', 'message': messages, 'messages': []}
+    response = {'status': 'FAIL', 'message': message, 'messages': []}
 
     if extra_data:
         response.update(extra_data)

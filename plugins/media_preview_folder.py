@@ -410,7 +410,7 @@ class MakeMediaPreviewJob(TaskWrapper):
         self.all_folders = all_folders
         self.force = force
         self.media_position = media_position
-        self.weight = 50
+        self.weight = 25
         if folder_id != '*':
             self.ref_folder_id = folder_id
 
@@ -434,13 +434,18 @@ class MakeMediaPreviewJob(TaskWrapper):
                     if self.multiple_file:
                         file_list = self.file_id.split(",")
                         for file in file_list:
-                            get_file_by_user(file, self.user, db_session)
+                            media_file, media_folder = get_file_by_user(file, self.user, db_session)
+                            self.ref_folder_id = media_folder.id
+                            self.ref_folder_preview = media_folder.preview == True
                     else:
-                        get_file_by_user(self.file_id, self.user, db_session)
+                        media_file, media_folder = get_file_by_user(self.file_id, self.user, db_session)
+                        self.ref_folder_id = media_folder.id
+                        self.ref_folder_preview = media_folder.preview == True
                 else:
                     # Make sure we have access
                     self.trace('Checking for User access to Folder')
                     existing_row = get_folder_by_user(self.folder_id, self.user, db_session)
+                    self.ref_folder_id = self.folder_id
             except ValueError as ve:
                 logging.exception(ve)
                 self.error(str(ve))
@@ -546,7 +551,7 @@ def generate_thumbnail(mime_type: str, input_file, output_file, tw: TaskWrapper 
                 file_size = os.path.getsize(output_file)
                 tw.trace(f'Generated Image Size: {file_size}')
 
-            resize_image(output_file, output_file, 256)
+            resize_image(output_file, output_file, 256, 'WEBP')
 
         except ValueError as ve:
             tw.error(str(ve))
@@ -576,7 +581,7 @@ def generate_thumbnail(mime_type: str, input_file, output_file, tw: TaskWrapper 
                 try:
                     cover_art = Image.open(io.BytesIO(image.image_data))
                     cover_art.thumbnail((256, 256))
-                    cover_art.save(output_file)
+                    cover_art.save(output_file, "WEBP")
 
                     if tw is not None:
                         tw.set_worked()
@@ -590,7 +595,7 @@ def generate_thumbnail(mime_type: str, input_file, output_file, tw: TaskWrapper 
         except Exception as inst2:
             logging.exception(inst2)
     elif mime_type == 'image/png' or mime_type == 'image/jpg' or mime_type == 'image/jpeg' or mime_type == 'image/gif':  # MP3 file
-        resize_image(input_file, output_file, 128)
+        resize_image(input_file, output_file, 128, "WEBP")
         return True
     else:
         if tw is not None:

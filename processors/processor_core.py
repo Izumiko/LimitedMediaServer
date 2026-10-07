@@ -1,5 +1,7 @@
 import copy
+import threading
 from abc import ABC, abstractmethod
+from typing import ClassVar, Dict, Type
 from typing import Optional
 
 from db import Book
@@ -17,12 +19,23 @@ class CustomDownloadInterface(ABC):
         :param task_wrapper: A logger, not required
         """
         super().__init__()
+
         self.processor_id = processor_id
         self.processor_name = processor_name
 
         if task_wrapper is None:
             task_wrapper = NoOpTaskWrapper()
         self.task_wrapper = task_wrapper
+
+    def get_locking_key(self):
+        return None
+
+    def is_ready(self) -> bool:
+        """
+        Is this processor ready?
+        :return: True is ready to process, False otherwise
+        """
+        return True
 
     def get_name(self):
         return self.processor_name
@@ -126,6 +139,9 @@ class CustomDownloadInterface(ABC):
                 Does this processor need the RSS field?
                 :return: True if it needs the RSS field
                 """
+        return False
+
+    def check_and_retry(self):
         return False
 
     # noinspection PyMethodMayBeStatic

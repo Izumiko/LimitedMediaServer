@@ -3,6 +3,7 @@ import os.path
 import shutil
 import subprocess
 from datetime import datetime
+import shlex
 
 from flask_sqlalchemy.session import Session
 
@@ -48,18 +49,16 @@ class DownloadM3u8Plugin(ActionMediaFolderPlugin):
         result = super().get_action_args()
 
         result.append(
-            plugin_url_arg('URL', 'url', 'The link to the m3u8 file.')
+            plugin_select_arg('Location', 'dest', 'primary',
+                              plugin_select_values('Primary Disk', 'primary', 'Archive Disk', 'archive'), '', 'media')
         )
 
         result.append(
             plugin_filename_arg('Filename', 'filename', 'The name of the file.')
         )
 
-        #result.append(plugin_select_arg('Send Headers', 'headers', 'n', PLUGIN_VALUES_Y_N, 'Send headers with command?'))
-
         result.append(
-            plugin_select_arg('Location', 'dest', 'primary',
-                              plugin_select_values('Primary Disk', 'primary', 'Archive Disk', 'archive'), '', 'media')
+            plugin_url_arg('URL', 'url', 'The link to the m3u8 file.', "", "yes", "url")
         )
 
         return result
@@ -124,7 +123,7 @@ class DownloadM3u8Job(TaskWrapper):
 
             temp_file = os.path.join(temp_folder, 'download.mp4')
 
-            arguments = ['-nostdin', '-i', self.url, '-c', 'copy', temp_file]
+            arguments = ['ffmpeg', '-nostdin', '-i', self.url, '-c', 'copy', temp_file]
 
             headers = get_headers(self.url, False, self, False, get_base_url(self.url), True)
 
@@ -132,8 +131,12 @@ class DownloadM3u8Job(TaskWrapper):
                 for key, value in headers.items():
                     arguments.extend(['-headers', f'{key}: {value}'])
 
+            if self.can_trace():
+                command_str = shlex.join(arguments)
+                self.trace(command_str)
+
             # Run the program with the provided arguments
-            process = subprocess.Popen(['ffmpeg'] + arguments, cwd=temp_folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            process = subprocess.Popen(arguments, cwd=temp_folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
             # Wait for the process to finish
             stdout, stderr = process.communicate()  # Capture the output and error streams

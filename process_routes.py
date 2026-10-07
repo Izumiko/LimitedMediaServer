@@ -4,78 +4,139 @@ import os
 import time
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
+from math import floor
 
 from flask import Blueprint, request, current_app
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, Session
 
-from auth_utils import shall_authenticate_user, feature_required, feature_required_silent, get_username, get_uid
+from auth_utils import shall_authenticate_user, feature_required, feature_required_silent, get_username, get_uid, \
+    get_user_features
 from common_utils import generate_failure_response, generate_success_response
 from constants import MAX_WORKERS
 from db import db
 from feature_flags import MANAGE_PROCESSES, VIEW_PROCESSES, MANAGE_APP
+from key_lock_manager import KeyLockManager
 from messages import msg_invalid_parameter, msg_tasks_started, msg_action_cancelled_duplicate_task, \
     msg_missing_parameter, msg_action_failed, msg_operation_complete, msg_action_failed_missing, msg_removed_x_items, \
-    msg_found_x_results, msg_access_denied_content_rating
+    msg_found_x_results, msg_access_denied_content_rating, msg_found_x_results_removed_y, msg_auth_feature_required
 from number_utils import is_integer
-from text_utils import is_blank
-from thread_utils import TaskManager, get_exception
+from text_utils import is_blank, clean_string
+from thread_utils import TaskManager, get_exception, TaskWrapper, TaskWorker
 
 process_blueprint = Blueprint('process', __name__)
 
 # Initialize TaskManager
-global task_manager
+global task_manager, worker_queue_number
 task_manager = TaskManager()
 
-# Initialize ThreadPoolExecutor with a maximum of 5 worker threads
+# One instance
+key_lock_manager = KeyLockManager()
+
+# Initialize ThreadPoolExecutor with a maximum # of worker threads
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+
+def close_queue_session(my_task_manager: TaskManager, task_wrapper: TaskWrapper, session: Session,
+                        worker_status: TaskWorker):
+    try:
+        worker_status.position = 9
+        my_task_manager.task_done_queue(task_wrapper, worker_status)
+        worker_status.position = 10
+        task_wrapper.mark_end()
+        worker_status.position = 11
+        if session is not None:
+            worker_status.position = 12
+            session.close()
+    except Exception as inst:
+        worker_status.position = 13
+        logging.error(inst)
+        worker_status.position = 14
+        task_wrapper.add_log(str(inst))
+        worker_status.position = 15
+    worker_status.position = 20
 
 
 # Worker function to consume tasks
-def queue_worker(task_manager: TaskManager, app):
+def queue_worker(my_task_manager: TaskManager, app, index: int):
+    worker_status = my_task_manager.add_worker(index)
+
     while True:
-        task_wrapper = task_manager.get_task_queue()
+        worker_status.wait_stamp = 0
+        worker_status.position = 1
+        task_wrapper = my_task_manager.get_task_queue()
         if task_wrapper is None:
+            worker_status.position = 2
             time.sleep(3)
             continue  # Sentinel to exit
 
+        lock_key = task_wrapper.get_locking_key()
+
+        if not key_lock_manager.acquire(lock_key):
+            task_wrapper.trace('Waiting')
+            my_task_manager.return_task_to_queue(task_wrapper)
+            time.sleep(3)
+            continue
+
+        worker_status.job = task_wrapper.task_id
         session = None
         try:
+            worker_status.position = 3
             task_wrapper.trace('Before Context')
             with app.app_context():
-
-                Session = sessionmaker(bind=db.engine)
-                session = Session()
+                task_wrapper.trace('In Context')
+                worker_status.position = 4
+                SessionMak = sessionmaker(bind=db.engine)
+                session = SessionMak()
 
                 # Create a new session for the thread
                 task_wrapper.trace('Before Local Session')
                 task_wrapper.mark_start()
-                task_wrapper.always('Executing')
+                task_wrapper.always('Executing Task')
                 username = get_username(task_wrapper.user)
                 uid = get_uid(task_wrapper.user)
                 task_wrapper.info(f'Executed by {username} ({uid})')
                 task_wrapper.set_waiting(False)
                 task_wrapper.run(session)
                 task_wrapper.set_finished(True)
-                task_wrapper.always('Finished')
+                task_wrapper.always('Finished Task')
         except Exception as inst:
+            worker_status.position = 5
             logging.error(inst)
             task_wrapper.add_log(str(inst))
             ex_json = get_exception()
-
+            worker_status.position = 6
             task_wrapper.set_finished(True)
             task_wrapper.set_failure(True)
             task_wrapper.error(
                 'Exception: ' + ex_json['message'] + ' - ' + ex_json['file'] + '[' + ex_json['line'] + ']')
         finally:
-            task_wrapper.mark_end()
-            task_manager.task_done_queue(task_wrapper)
-            if session is not None:
-                session.close()
+            key_lock_manager.release(lock_key)
+            worker_status.position = 70
+            close_queue_session(my_task_manager, task_wrapper, session, worker_status)
+            worker_status.position = 72
+            worker_status.wait_stamp = time.time()
+    worker_status.online = False
 
 
 def init_processors(app):
-    global task_manager
-    workers = [executor.submit(queue_worker, task_manager, app) for _ in range(MAX_WORKERS)]
+    global task_manager, worker_queue_number
+    worker_queue_number = 1
+    for i in range(MAX_WORKERS):
+        init_processor(app)
+
+
+def init_processor(app):
+    global task_manager, worker_queue_number
+    executor.submit(queue_worker, task_manager, app, worker_queue_number)
+    worker_queue_number = worker_queue_number + 1
+
+
+@process_blueprint.route('/add/worker', methods=['POST'])
+@feature_required(process_blueprint, MANAGE_PROCESSES)
+def add_worker(user_details):
+    app = current_app._get_current_object()  # gets the actual app, not the proxy
+    with app.app_context():
+        init_processor(app)
+    return generate_success_response('', messages=[msg_operation_complete()])
 
 
 @process_blueprint.route('/add/plugin', methods=['POST'])
@@ -118,6 +179,7 @@ def add_plugin_task(user_details):
                     return generate_failure_response("User is not allowed to use the specified plugin", 401,
                                                      messages=[msg_access_denied_content_rating()])
 
+                task_args['_user_details'] = user_details
                 error_list = plugin.process_action_args(task_args)
                 if error_list is None:
 
@@ -220,13 +282,94 @@ def restart_service(user_details):
 @process_blueprint.route('/status/all', methods=['POST'])
 @feature_required(process_blueprint, VIEW_PROCESSES)
 def get_all_task_status(user_detail):
+    return get_all_task_status_extra_method(user_detail, '')
+
+
+@process_blueprint.route('/status/all/with/<extra_method_call>', methods=['POST'])
+@feature_required(process_blueprint, VIEW_PROCESSES)
+def get_all_task_status_extra_method(user_detail, extra_method_call):
     global task_manager
+
+    page = clean_string(request.form.get('page'))
+    page_size = clean_string(request.form.get('page_size'))
+
+    if not page:
+        page = 0
+    elif is_integer(page):
+        page = int(page)
+    else:
+        page = 0
+
+    if not page_size:
+        page_size = 20
+    elif is_integer(page_size):
+        page_size = int(page_size)
+    else:
+        page_size = 20
+
+
+
+    removed = task_manager.remove_dead_tasks()
+
+    if removed > 0:
+        app = current_app._get_current_object()  # gets the actual app, not the proxy
+        with app.app_context():
+            for i in range(removed):
+                init_processor(app)
+
+    removed_tasks = 0
+    active_only = False
+
+    if is_blank(extra_method_call) or extra_method_call == 'NONE':
+        pass
+    elif extra_method_call == 'ACTIVE':
+        active_only = True
+    else:
+        if get_user_features(user_detail) & MANAGE_PROCESSES != MANAGE_PROCESSES:
+            return generate_failure_response('Not allowed to use this method', 401, msg_auth_feature_required())
+
+        if extra_method_call == 'HARD':
+            removed_tasks = task_manager.clean_tasks(True)
+        elif extra_method_call == 'SOFT':
+            removed_tasks = task_manager.clean_tasks(False)
 
     tasks = task_manager.get_all_tasks()
 
     result = []
 
-    for task in tasks:
+    total_items = len(tasks)
+
+    pages = floor(total_items / page_size)
+    # Check for overflow
+    if total_items % page_size > 0:
+        pages = pages + 1
+
+    # Sanity
+
+    if page_size < 0:
+        page_size = 20
+    elif page_size > 150:
+        page_size = 150
+
+    if pages == 1:
+        page = 0
+    elif page < 0:
+        page = 0
+    elif pages > 0 and page >= page_size:
+        page = page_size - 1
+    elif pages == 0:
+        page = 0
+
+    start = page * page_size
+    end = start + page_size
+
+    for task in tasks[start:end]:
+        if not task:
+            break
+
+        if active_only and (task.is_finished or task.is_waiting):
+            continue
+
         result.append({
             "id": task.task_id,
             "name": task.name,
@@ -239,7 +382,7 @@ def get_all_task_status(user_detail):
             "warning": task.is_warning,
             "worked": task.is_worked,
             "logging": task.logging_level,
-            "log": task.log_entries,
+            "log": task.log_entries[-2:],
             "delay_duration": task.duration_delayed,
             "running_duration": task.duration_running,
             "total_duration": task.duration_total,
@@ -248,11 +391,24 @@ def get_all_task_status(user_detail):
             "end_timestamp": task.end_timestamp,
             "book_id": task.ref_book_id,
             "folder_id": task.ref_folder_id,
+            "folder_img": task.ref_folder_preview,
             "priority": task.priority,
             "weight": task.weight
         })
 
-    return generate_success_response('', {'tasks': result}, messages=[msg_found_x_results(len(tasks))])
+    msg = None
+    if removed_tasks == 0:
+        msg = msg_found_x_results(len(tasks))
+    else:
+        msg = msg_found_x_results_removed_y(len(tasks), removed_tasks)
+
+    return generate_success_response('', {'page': page,
+                                          'pages': pages,
+                                          'total': total_items,
+                                          'tasks': result,
+                                          'weight': task_manager.get_weight(),
+                                          'workers': task_manager.get_worker_status()},
+                                     messages=[msg])
 
 
 # REST endpoint to get task status

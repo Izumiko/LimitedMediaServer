@@ -1,13 +1,16 @@
 import argparse
+import datetime
 import platform
 import random
-from itertools import cycle
 import re
+from itertools import cycle
+from typing import Optional
 
 from flask_sqlalchemy.session import Session
 
 from db import Book
 from feature_flags import MANAGE_VOLUME
+from html_utils import has_valid_headers
 from plugin_methods import plugin_long_string_arg, plugin_select_arg, plugin_select_values, plugin_url_arg
 from plugin_system import ActionBookSpecificPlugin, ActionBookGeneralPlugin
 from plugins.book_update_headers import UpdateVolumeHeader
@@ -16,6 +19,13 @@ from text_utils import is_not_blank, is_blank
 from thread_utils import TaskWrapper
 from volume_queries import find_book_by_id
 from volume_utils import parse_curl_headers
+
+
+def processor_for_id(processors, processor_id: str) -> Optional["CustomDownloadInterface"]:
+    for processor in processors:
+        if processor.processor_id == processor_id:
+            return processor
+    return None
 
 
 # Example function to group books by processor
@@ -90,21 +100,29 @@ class UpdateAllBooksPlugin(ActionBookGeneralPlugin):
 
     def get_action_args(self):
 
-        values = [{"id": "*", "name": "All"}]
+        filter_values = [{"id": "*", "name": "All"}]
+        exclude_values = [{"id": "*", "name": "None"}]
 
         for processor in self.processors:
-            values.append({"id": processor.processor_id, "name": processor.processor_name})
+            if processor.is_ready():
+                filter_values.append({"id": processor.processor_id, "name": processor.processor_name})
+                exclude_values.append({"id": processor.processor_id, "name": processor.processor_name})
 
         result = super().get_action_args()
 
         result.append(
-            plugin_select_arg('Filter', 'filter', '*', values, "When not *, only Processors that match will execute.",
-                              'book'))
+            plugin_select_arg('Filter', 'filter', '*', filter_values,
+                              "When not *, only Processors that match will execute.",
+                              'book', adv='Y'))
+
+        result.append(
+            plugin_select_arg('Exclude', 'exclude', '*', exclude_values, "Choose a processor to not process.",
+                              'book', adv='Y'))
 
         result.append(plugin_select_arg('Cleaning', 'cleaning', 'n',
                                         plugin_select_values('New Chapters', 'n', 'All Chapters', 'a'),
                                         "Determines when content will be cleaned.  Normally only 'New Chapters' will be cleaned, but choose 'All Chapters' will cause it to purge new and existing chapters.  All files < 10kb or invalid will be removed.",
-                                        'com'))
+                                        'com', adv='Y'))
 
         result.append(plugin_long_string_arg('Headers', 'headers',
                                              'Open Chrome and access any site that is protected by a service you want to get around.  Open chrome dev tools (F12).  Refresh the page.  In the Developer tools network tab, click the page, the 1st item, right click, copy, Copy as cURL (Bash).  Paste that here.',
@@ -113,7 +131,7 @@ class UpdateAllBooksPlugin(ActionBookGeneralPlugin):
         result.append(plugin_select_arg('Cleaning', 'cleaning', 'n',
                                         plugin_select_values('New Chapters', 'n', 'All Chapters', 'a'),
                                         "Determines when content will be cleaned.  Normally only 'New Chapters' will be cleaned, but choose 'All Chapters' will cause it to purge new and existing chapters.  All files < 10kb or invalid will be removed.",
-                                        'com'))
+                                        'com', adv='Y'))
 
         return result
 
@@ -123,11 +141,16 @@ class UpdateAllBooksPlugin(ActionBookGeneralPlugin):
         if 'filter' not in args or args['filter'] is None or is_blank(args['filter']) == '':
             results.append('filter is required')
 
+        if 'exclude' not in args or args['exclude'] is None or is_blank(args['exclude']) == '':
+            results.append('exclude is required')
+
         if 'cleaning' not in args or args['cleaning'] is None or args['cleaning'] == '':
             results.append('cleaning is required')
 
         if 'headers' not in args or is_blank(args['headers']):
             args['headers'] = None
+            if not has_valid_headers():
+                results.append('headers are required to continue')
         elif not args['headers'].startswith('curl'):
             results.append('headers must be a curl bash command')
         else:
@@ -151,19 +174,38 @@ class UpdateAllBooksPlugin(ActionBookGeneralPlugin):
 
         cleaning = (args['cleaning'] == 'a')
 
-        books = db_session.query(Book).filter(Book.active == True).all()
+        seven_days_ago = datetime.date.today() - datetime.timedelta(days=7)
+
+        books = db_session.query(Book).filter(Book.active == True, Book.last_date < seven_days_ago).all()
 
         grouped_books = group_books_by_processor(books)
         interleaved_books = interleave_books(grouped_books)
 
+        processor_lookup = {}
+        for processor in self.processors:
+            processor_lookup[processor.processor_id] = processor
+
         processor_filter = args['filter']
+        exclude_filter = args['exclude']
 
         for book in interleaved_books:
-            if processor_filter == '*' or processor_filter == book.processor:
+            if (processor_filter == '*' or processor_filter == book.processor) and (
+                    exclude_filter == '*' or (exclude_filter != book.processor)):
+
+                processor = None
+
+                if book.processor in processor_lookup:
+                    processor = processor_lookup[book.processor]
+                    if not processor.is_ready():
+                        continue
+
+                if processor is None:
+                    continue
+
                 results.append(
-                    DownloadBookJob("GetBook", f'Updating: {book.name}', book.id, self.processors,
-                                    self.book_storage_folder, self.book_storage_format,
-                                    cleaning))
+                    DownloadBookJob("GetBook", f'Updating: {book.name} ({book.processor})', book.id, processor,
+                                    self.processors,
+                                    self.book_storage_folder, self.book_storage_format, cleaning))
 
         return results
 
@@ -224,6 +266,8 @@ class UpdateSingleBookPlugin(ActionBookSpecificPlugin):
 
         if 'headers' not in args or is_blank(args['headers']):
             args['headers'] = None
+            if not has_valid_headers():
+                results.append('headers are required to continue')
         elif not args['headers'].startswith('curl'):
             results.append('headers must be a curl bash command')
         else:
@@ -253,7 +297,10 @@ class UpdateSingleBookPlugin(ActionBookSpecificPlugin):
         if is_not_blank(book_id):
             book = find_book_by_id(book_id, db_session)
             if book is not None:
-                the_book = DownloadBookJob("GetBook", f'Updating: {book.name}', book.id, self.processors,
+
+                processor = processor_for_id(self.processors, book.processor)
+
+                the_book = DownloadBookJob("GetBook", f'Updating: {book.name}', book.id, processor, self.processors,
                                            self.book_storage_folder, self.book_storage_format, cleaning == 'a')
                 if len(results) == 0:
                     return the_book
@@ -262,9 +309,11 @@ class UpdateSingleBookPlugin(ActionBookSpecificPlugin):
 
         return results
 
+
 def is_valid_format(s):
-    pattern = r'^\d{4}(\.\d+)?$|^chapter-\d+(\.\d+)?$'
+    pattern = r'^\d{4,6}(\.\d+)?$|^chapter-\d+(\.\d+)?$'
     return bool(re.match(pattern, s))
+
 
 class UpdateSingleBookChapterPlugin(ActionBookSpecificPlugin):
     """
@@ -304,7 +353,8 @@ class UpdateSingleBookChapterPlugin(ActionBookSpecificPlugin):
         result = super().get_action_args()
 
         result.append(plugin_url_arg("Chapter URL", 'chapter_url', 'The URL to download'))
-        result.append(plugin_long_string_arg("Chapter Name", 'chapter_name', 'Name of the chapter, like Chapter-1, 0001, or 0001.5'))
+        result.append(plugin_long_string_arg("Chapter Name", 'chapter_name',
+                                             'Name of the chapter, like Chapter-1, 0001, or 0001.5'))
 
         result.append(plugin_select_arg('Cleaning', 'cleaning', 'n',
                                         plugin_select_values('New Chapters', 'n', 'All Chapters', 'a'),
@@ -365,7 +415,11 @@ class UpdateSingleBookChapterPlugin(ActionBookSpecificPlugin):
         if is_not_blank(book_id):
             book = find_book_by_id(book_id, db_session)
             if book is not None:
-                the_book = DownloadBookChapterJob("GetBookChap", f'Updating: {book.name} {chapter_name}', chapter_url, chapter_name, book.id, self.processors,
+
+                processor = processor_for_id(self.processors, book.processor)
+
+                the_book = DownloadBookChapterJob("GetBookChap", f'Updating: {book.name} {chapter_name}', chapter_url,
+                                                  chapter_name, book.id, processor, self.processors,
                                                   self.book_storage_folder, self.book_storage_format, cleaning == 'a')
                 if len(results) == 0:
                     return the_book
@@ -376,15 +430,17 @@ class UpdateSingleBookChapterPlugin(ActionBookSpecificPlugin):
 
 
 class DownloadBookJob(TaskWrapper):
-    def __init__(self, name, description, book_id, processors, book_folder: str, storage_format: str = 'PNG',
+    def __init__(self, name, description, book_id, processor, processors, book_folder: str, storage_format: str = 'PNG',
                  clean_all: bool = False):
         super().__init__(name, description)
         self.book_id = book_id
         self.processors = processors
+        self.processor = processor
         self.clean_all = clean_all
         self.book_folder = book_folder
         self.storage_format = storage_format
         self.ref_book_id = book_id
+        self.set_locking_key(self.processor.get_locking_key())
 
     def run(self, db_session: Session):
 
@@ -404,10 +460,13 @@ class DownloadBookJob(TaskWrapper):
 
 
 class DownloadBookChapterJob(TaskWrapper):
-    def __init__(self, name, description, chapter_url: str, chapter_name: str, book_id, processors, book_folder: str, storage_format: str = 'PNG',
+    def __init__(self, name, description, chapter_url: str, chapter_name: str, book_id, processor, processors,
+                 book_folder: str,
+                 storage_format: str = 'PNG',
                  clean_all: bool = False):
         super().__init__(name, description)
         self.book_id = book_id
+        self.processor = processor
         self.processors = processors
         self.clean_all = clean_all
         self.book_folder = book_folder
@@ -415,6 +474,8 @@ class DownloadBookChapterJob(TaskWrapper):
         self.ref_book_id = book_id
         self.chapter_url = chapter_url
         self.chapter_name = chapter_name
+        self.set_locking_key(self.processor.get_locking_key())
+
 
     def run(self, db_session: Session):
 

@@ -1,8 +1,11 @@
+import io
 import logging
 import os
+import shutil
 from datetime import datetime, timedelta, timezone
 
-from flask import Blueprint, send_from_directory, current_app, request, make_response, abort
+from PIL import Image
+from flask import Blueprint, send_from_directory, current_app, request, make_response, abort, send_file
 from werkzeug.utils import secure_filename
 
 from auth_utils import shall_authenticate_user, feature_required, feature_required_with_cookie, get_uid
@@ -11,15 +14,17 @@ from constants import PROPERTY_SERVER_VOLUME_FOLDER, PROPERTY_SERVER_VOLUME_READ
 from date_utils import convert_date_to_yyyymmdd, convert_datetime_to_yyyymmdd
 from db import db, Book
 from feature_flags import BOOKMARKS, VIEW_BOOKS, MANAGE_VOLUME
-from image_utils import split_and_save_image, merge_two_images
+from filename_utils import decompress_filenames
+from image_utils import split_and_save_image, merge_two_images, resize_image
 from messages import msg_action_cancelled_wrong, msg_missing_parameter, msg_invalid_parameter, \
-    msg_access_denied_content_rating, msg_operation_complete, msg_action_failed, msg_server_error, msg_book_added
+    msg_access_denied_content_rating, msg_operation_complete, msg_action_failed, msg_server_error, msg_book_added, \
+    msg_book_removed
 from number_utils import is_integer, parse_boolean, is_boolean
 from text_utils import is_blank, clean_string, is_valid_book_id, is_not_blank
 from volume_queries import list_books_for_rating, find_chapters_by_book, find_book_by_id, find_chapter_by_id, \
     find_chapter_by_sequence, upsert_book, upsert_recent, \
     find_bookmarks, add_volume_bookmark, remove_volume_bookmark, \
-    count_books_for_rating, find_recent_entries
+    count_books_for_rating, find_recent_entries, manage_remove_book, find_tags, search_tags
 from volume_utils import get_volume_max_rating
 
 volume_blueprint = Blueprint('volume', __name__)
@@ -48,6 +53,12 @@ def get_books(user_details: dict) -> tuple:
     requested_rating_limit = clean_string(request.form.get('rating'))
     sort = clean_string(request.form.get('sort'))
     filter_text = clean_string(request.form.get('filter_text'))
+    filter_tags = clean_string(request.form.get('filter_tags'))
+    if len(filter_tags) > 0:
+        filter_tags = [t.strip().upper() for t in (filter_tags or "").split(",") if t.strip()]
+    else:
+        filter_tags = []
+
     user_uid = get_uid(user_details)
 
     if is_not_blank(offset) and is_integer(offset):
@@ -70,7 +81,8 @@ def get_books(user_details: dict) -> tuple:
     max_rating = get_volume_max_rating(user_details)
 
     if requested_rating_limit > max_rating:
-        return generate_failure_response('Requested rating is greater then user max level', messages=[msg_access_denied_content_rating()])
+        return generate_failure_response('Requested rating is greater then user max level',
+                                         messages=[msg_access_denied_content_rating()])
 
     if is_not_blank(sort):
         if sort == 'AZ':
@@ -92,15 +104,15 @@ def get_books(user_details: dict) -> tuple:
         book_sort = Book.name
         sort_descending = False
 
-    total_books = count_books_for_rating(requested_rating_limit, filter_text)
+    total_books = count_books_for_rating(requested_rating_limit, filter_text, filter_tags)
 
     if offset > total_books:
         offset = 0
 
-    books_with_progress = list_books_for_rating(user_uid, requested_rating_limit, filter_text, book_sort,
-                                                sort_descending, offset,
-                                                limit,
-                                                db.session)
+    books_with_progress = list_books_for_rating(user_uid, requested_rating_limit, filter_text, filter_tags=filter_tags,
+                                                sort_field=book_sort,
+                                                sort_descending=sort_descending, query_offset=offset, query_limit=limit,
+                                                db_session=db.session)
 
     for book, progress in books_with_progress:
 
@@ -156,7 +168,8 @@ def get_chapters(user_details: dict) -> tuple:
     max_rating = get_volume_max_rating(user_details)
 
     if book.rating > max_rating:
-        return generate_failure_response('User is not allowed to view content out of their rating zone', messages=[msg_access_denied_content_rating()])
+        return generate_failure_response('User is not allowed to view content out of their rating zone',
+                                         messages=[msg_access_denied_content_rating()])
 
     chapters = find_chapters_by_book(book_id, user_uid)
 
@@ -176,9 +189,27 @@ def get_chapters(user_details: dict) -> tuple:
 
         chapter_results.append(entry)
 
+    info_url = ''
+    if book.info_url is not None:
+        info_url = book.info_url
+
     style = 'scroll' if book.style == 'S' else 'page'
 
-    return generate_success_response('', {'chapters': chapter_results, 'style': style})
+    return generate_success_response('', {'chapters': chapter_results, 'name': book.name, 'style': style, 'info_url': info_url})
+
+
+@volume_blueprint.route('/list/tags', methods=['POST'])
+@feature_required(volume_blueprint, VIEW_BOOKS)
+def get_tags(user_details: dict) -> tuple:
+    if not current_app.config[PROPERTY_SERVER_VOLUME_READY]:
+        return generate_failure_response('Volume service not ready', 400, messages=[msg_server_error()])
+
+    tags = []
+    for tag in find_tags():
+        tags.append(tag.name)
+
+    return generate_success_response('', {'tags': tags})
+
 
 
 @volume_blueprint.route('/list/images', methods=['POST'])
@@ -194,6 +225,8 @@ def get_images(user_details: dict) -> tuple:
     tuple: JSON response with the list of images and HTTP status code.
     """
 
+    include_sizes = request.args.get('include_sizes', default='false').lower() == 'true'
+
     if not current_app.config[PROPERTY_SERVER_VOLUME_READY]:
         return generate_failure_response('Volume service not ready', 400, messages=[msg_server_error()])
 
@@ -204,7 +237,8 @@ def get_images(user_details: dict) -> tuple:
         return generate_failure_response('book_id parameter is required', messages=[msg_missing_parameter('book_id')])
 
     if is_blank(chapter_id):
-        return generate_failure_response('chapter_id parameter is required', messages=[msg_missing_parameter('chapter_id')])
+        return generate_failure_response('chapter_id parameter is required',
+                                         messages=[msg_missing_parameter('chapter_id')])
 
     book = find_book_by_id(book_id)
 
@@ -214,7 +248,8 @@ def get_images(user_details: dict) -> tuple:
     max_rating = get_volume_max_rating(user_details)
 
     if book.rating > max_rating:
-        return generate_failure_response('User is not allowed to view content out of their rating zone', messages=[msg_access_denied_content_rating()])
+        return generate_failure_response('User is not allowed to view content out of their rating zone',
+                                         messages=[msg_access_denied_content_rating()])
 
     current_chapter = find_chapter_by_id(book_id, chapter_id)
 
@@ -224,11 +259,28 @@ def get_images(user_details: dict) -> tuple:
     prev_chapter_record = find_chapter_by_sequence(book_id, current_chapter.sequence - 1)
     next_chapter_record = find_chapter_by_sequence(book_id, current_chapter.sequence + 1)
 
-    files = current_chapter.image_names.split(',') if current_chapter.image_names else []
+    files = decompress_filenames(current_chapter.image_names) if current_chapter.image_names else []
     prev_chapter_id = prev_chapter_record.chapter_id if prev_chapter_record else ''
     next_chapter_id = next_chapter_record.chapter_id if next_chapter_record else ''
 
-    return generate_success_response('', {"prev": prev_chapter_id, "next": next_chapter_id, "files": files, "style": 'page' if book.style == 'P' else 'scroll'})
+    sizes = []
+
+    if include_sizes:
+        for file_name in files:
+            file_path = os.path.join(current_app.config[PROPERTY_SERVER_VOLUME_FOLDER], book_id, chapter_id, file_name)
+            w, h = 0, 0
+            if (os.path.exists(file_path)):
+                try:
+                    with Image.open(file_path) as img:
+                        w, h = img.size
+                except Exception:
+                    w, h = 0, 0
+
+            sizes.append({"w": w, "h": h})
+
+    return generate_success_response('',
+                                     {"prev": prev_chapter_id, "next": next_chapter_id, "sizes": sizes, "files": files,
+                                      "style": 'page' if book.style == 'P' else 'scroll'})
 
 
 @volume_blueprint.route('/progress', methods=['POST'])
@@ -246,7 +298,8 @@ def push_progress(user_details):
         return generate_failure_response('book_id parameter is required', messages=[msg_missing_parameter('book_id')])
 
     if is_blank(chapter_id):
-        return generate_failure_response('chapter_id parameter is required', messages=[msg_missing_parameter('chapter_id')])
+        return generate_failure_response('chapter_id parameter is required',
+                                         messages=[msg_missing_parameter('chapter_id')])
 
     if is_blank(value):
         return generate_failure_response('value parameter is required', messages=[msg_missing_parameter('value')])
@@ -259,7 +312,8 @@ def push_progress(user_details):
     max_rating = get_volume_max_rating(user_details)
 
     if book.rating > max_rating:
-        return generate_failure_response('User is not allowed to view content out of their rating zone', messages=[msg_access_denied_content_rating()])
+        return generate_failure_response('User is not allowed to view content out of their rating zone',
+                                         messages=[msg_access_denied_content_rating()])
 
     client_page = None
     client_progress = None
@@ -297,12 +351,16 @@ def remove_image(user_details):
         return generate_failure_response('Could not find book', messages=[msg_action_cancelled_wrong()])
 
     if book_row.rating > max_rating:
-        return generate_failure_response('You are not allowed to view this book', messages=[msg_access_denied_content_rating()])
+        return generate_failure_response('You are not allowed to view this book',
+                                         messages=[msg_access_denied_content_rating()])
 
     chapter_row = find_chapter_by_id(book_id, chapter_id)
 
     if chapter_row is None:
         return generate_failure_response('Could not find chapter', messages=[msg_action_cancelled_wrong()])
+
+    current_images = decompress_filenames(chapter_row.image_names) if chapter_row.image_names else []
+    was_first = len(current_images) > 0 and current_images[0] == file_name
 
     if chapter_row.remove_image(file_name):
         file_path = os.path.join(current_app.config[PROPERTY_SERVER_VOLUME_FOLDER], book_id, chapter_id, file_name)
@@ -310,6 +368,18 @@ def remove_image(user_details):
             os.unlink(file_path)
             if not os.path.exists(file_path):
                 db.session.commit()
+
+                if was_first:
+                    updated_images = decompress_filenames(chapter_row.image_names) if chapter_row.image_names else []
+                    if updated_images:
+                        new_first_path = os.path.join(current_app.config[PROPERTY_SERVER_VOLUME_FOLDER], book_id, chapter_id, updated_images[0])
+                        preview_path = os.path.join(current_app.config[PROPERTY_SERVER_VOLUME_FOLDER], book_id, '.previews', chapter_id + '.webp')
+                        if os.path.exists(new_first_path):
+                            try:
+                                resize_image(new_first_path, preview_path, 200, 'WEBP')
+                            except Exception as e:
+                                logging.error(f'Could not regenerate chapter thumbnail: {e}')
+
                 return generate_success_response('Image removed', messages=[msg_operation_complete()])
             else:
                 db.session.rollback()
@@ -336,7 +406,8 @@ def merge_image(user_details):
         return generate_failure_response('Could not find book', messages=[msg_action_cancelled_wrong()])
 
     if book_row.rating > max_rating:
-        return generate_failure_response('You are not allowed to view this book', messages=[msg_access_denied_content_rating()])
+        return generate_failure_response('You are not allowed to view this book',
+                                         messages=[msg_access_denied_content_rating()])
 
     chapter_row = find_chapter_by_id(book_id, chapter_id)
 
@@ -354,7 +425,8 @@ def merge_image(user_details):
                     db.session.commit()
                     return generate_success_response('Image Merged', messages=[msg_operation_complete()])
                 else:
-                    return generate_failure_response('Image remove, but reference was not erased.', messages=[msg_action_failed()])
+                    return generate_failure_response('Image remove, but reference was not erased.',
+                                                     messages=[msg_action_failed()])
             else:
                 return generate_failure_response('Unable to merge images', messages=[msg_action_failed()])
         except ValueError as ve:
@@ -378,21 +450,26 @@ def split_image(user_details):
     if is_blank(position):
         return generate_failure_response('position parameter is required', messages=[msg_missing_parameter('position')])
     elif not is_integer(position):
-        return generate_failure_response('position parameter is not an integer', messages=[msg_invalid_parameter('position')])
+        return generate_failure_response('position parameter is not an integer',
+                                         messages=[msg_invalid_parameter('position')])
     else:
         position = int(position)
 
     if is_blank(is_horizontal):
-        return generate_failure_response('is_horizontal parameter is required', messages=[msg_missing_parameter('is_horizontal')])
+        return generate_failure_response('is_horizontal parameter is required',
+                                         messages=[msg_missing_parameter('is_horizontal')])
     elif not is_boolean(is_horizontal):
-        return generate_failure_response('is_horizontal parameter is not an boolean', messages=[msg_invalid_parameter('is_horizontal')])
+        return generate_failure_response('is_horizontal parameter is not an boolean',
+                                         messages=[msg_invalid_parameter('is_horizontal')])
     else:
         is_horizontal = parse_boolean(is_horizontal)
 
     if is_blank(keep_first):
-        return generate_failure_response('keep_first parameter is required', messages=[msg_missing_parameter('position')])
+        return generate_failure_response('keep_first parameter is required',
+                                         messages=[msg_missing_parameter('position')])
     elif not is_boolean(keep_first):
-        return generate_failure_response('keep_first parameter is not an boolean', messages=[msg_invalid_parameter('position')])
+        return generate_failure_response('keep_first parameter is not an boolean',
+                                         messages=[msg_invalid_parameter('position')])
     else:
         keep_first = parse_boolean(keep_first)
 
@@ -402,7 +479,8 @@ def split_image(user_details):
         return generate_failure_response('Could not find book', messages=[msg_action_cancelled_wrong()])
 
     if book_row.rating > max_rating:
-        return generate_failure_response('You are not allowed to view this book', messages=[msg_access_denied_content_rating()])
+        return generate_failure_response('You are not allowed to view this book',
+                                         messages=[msg_access_denied_content_rating()])
 
     chapter_row = find_chapter_by_id(book_id, chapter_id)
 
@@ -418,6 +496,52 @@ def split_image(user_details):
             return generate_failure_response(str(ve))
     else:
         return generate_failure_response('Image not found', messages=[msg_action_failed()])
+
+
+@volume_blueprint.route('/remove/chapter', methods=['POST'])
+@feature_required(volume_blueprint, MANAGE_VOLUME)
+def remove_chapter(user_details):
+    max_rating = get_volume_max_rating(user_details)
+    book_id = clean_string(request.form.get('book_id'))
+    chapter_id = clean_string(request.form.get('chapter_id'))
+
+    book_row = find_book_by_id(book_id)
+
+    if book_row is None:
+        return generate_failure_response('Could not find book', messages=[msg_action_cancelled_wrong()])
+
+    if book_row.rating > max_rating:
+        return generate_failure_response('You are not allowed to view this book',
+                                         messages=[msg_access_denied_content_rating()])
+
+    chapter_row = find_chapter_by_id(book_id, chapter_id)
+
+    if chapter_row is None:
+        return generate_failure_response('Could not find chapter', messages=[msg_action_cancelled_wrong()])
+
+    folder_path = os.path.join(current_app.config[PROPERTY_SERVER_VOLUME_FOLDER], book_id, chapter_id)
+
+    if os.path.exists(folder_path):
+        shutil.rmtree(folder_path)
+
+    preview_path = os.path.join(current_app.config[PROPERTY_SERVER_VOLUME_FOLDER], book_id, '.previews',
+                                chapter_id + '.webp')
+
+    if os.path.exists(preview_path):
+        os.unlink(preview_path)
+
+    db.session.delete(chapter_row)
+
+    existing_book_value = book_row.skip
+
+    if existing_book_value is None or len(existing_book_value) == 0:
+        book_row.skip = chapter_id
+    else:
+        book_row.skip = book_row.skip + "," + chapter_id
+
+    db.session.commit()
+
+    return generate_success_response('chapter removed', messages=[msg_operation_complete()])
 
 
 # Recent History
@@ -459,14 +583,6 @@ def list_history(user_details):
 def serve_image(user_details, book_folder: str, chapter_name: str, image_name: str) -> 'Response':
     """
     Serve an image file from the server.
-
-    Args:
-    book_folder (str): The folder containing the book.
-    chapter_name (str): The name of the chapter.
-    image_name (str): The name of the image file.
-
-    Returns:
-    Response: The image file or a 404 error if not found.
     """
     if not current_app.config[PROPERTY_SERVER_VOLUME_READY]:
         return generate_failure_response('Volume service not ready', 400)
@@ -479,23 +595,52 @@ def serve_image(user_details, book_folder: str, chapter_name: str, image_name: s
     if not book_record:
         return generate_failure_response('Volume not found', 404)
 
-    # Get the user's max rating
+    # Check user rating access
     max_rating = get_volume_max_rating(user_details)
-
     if book_record.rating > max_rating:
         return generate_failure_response('User is not allowed to view content out of their rating zone')
 
     file_path = os.path.join(current_app.config[PROPERTY_SERVER_VOLUME_FOLDER], book_folder, chapter_name, image_name)
 
-    if os.path.exists(file_path) and os.path.isfile(file_path):
-        response = make_response(send_from_directory(os.path.dirname(file_path), os.path.basename(file_path)))
-        expires_at = datetime.now() + timedelta(hours=5)
-        response.headers['Cache-Control'] = 'public, max-age=18000'  # 5 hours cache
-        response.headers['Expires'] = expires_at.strftime('%a, %d %b %Y %H:%M:%S GMT')
-        return response
-    else:
+    if not (os.path.exists(file_path) and os.path.isfile(file_path)):
         logging.warning('File not found: ' + file_path)
         abort(404)
+
+    # Check for quick mode
+    quick = request.args.get('quick', 'false').lower() == 'true'
+
+    if quick:
+        try:
+            # Open and shrink the image
+            with Image.open(file_path) as img:
+                width, height = img.size
+                if width > 256:
+                    new_height = int((256 / width) * height)
+                    img = img.resize((256, new_height), Image.LANCZOS)
+
+                # Save to in-memory bytes
+                img_bytes = io.BytesIO()
+                img_format = img.format if img.format else 'JPEG'
+                img.save(img_bytes, format=img_format)
+                img_bytes.seek(0)
+
+            # Build the Flask response
+            response = make_response(send_file(img_bytes, mimetype=f'image/{img_format.lower()}'))
+            expires_at = datetime.now() + timedelta(minutes=1)
+            response.headers['Cache-Control'] = 'public, max-age=60'
+            response.headers['Expires'] = expires_at.strftime('%a, %d %b %Y %H:%M:%S GMT')
+            return response
+
+        except Exception as e:
+            logging.exception(f'Error generating quick image for {file_path}: {e}')
+            abort(500)
+
+    # Default: full-size image, 5-hour cache
+    response = make_response(send_from_directory(os.path.dirname(file_path), os.path.basename(file_path)))
+    expires_at = datetime.now() + timedelta(hours=5)
+    response.headers['Cache-Control'] = 'public, max-age=18000'  # 5 hours
+    response.headers['Expires'] = expires_at.strftime('%a, %d %b %Y %H:%M:%S GMT')
+    return response
 
 
 @volume_blueprint.route('/serve_preview/<book_folder>/<chapter_name>', methods=['GET'])
@@ -518,7 +663,7 @@ def serve_preview_image(user_details, book_folder: str, chapter_name: str) -> 'R
     chapter_name = secure_filename(chapter_name)
 
     file_path = os.path.join(current_app.config[PROPERTY_SERVER_VOLUME_FOLDER], book_folder, '.previews',
-                             chapter_name + '.png')
+                             chapter_name + '.webp')
 
     if os.path.exists(file_path) and os.path.isfile(file_path):
         response = make_response(send_from_directory(os.path.dirname(file_path), os.path.basename(file_path)))
@@ -621,10 +766,12 @@ def add_bookmark(user_details: dict) -> tuple:
         return generate_failure_response('book_id parameter is required', messages=[msg_missing_parameter('book_id')])
 
     if is_blank(chapter_id):
-        return generate_failure_response('chapter_id parameter is required', messages=[msg_missing_parameter('chapter_id')])
+        return generate_failure_response('chapter_id parameter is required',
+                                         messages=[msg_missing_parameter('chapter_id')])
 
     if is_blank(page_value):
-        return generate_failure_response('page_number parameter is required', messages=[msg_missing_parameter('page_number')])
+        return generate_failure_response('page_number parameter is required',
+                                         messages=[msg_missing_parameter('page_number')])
 
     if page_value.startswith('@'):
         page_progress = float(page_value[1:])
@@ -710,6 +857,7 @@ def get_book_details(user_details: dict) -> tuple:
 BOOK_FIELDS = ['id', 'name', 'processor', 'active', 'info_url', 'rss_url', 'extra_url', 'start_chapter', 'skip',
                'rating', 'tags', 'style']
 BOOK_REQUIRED_FIELDS = ['id', 'name', 'processor', 'active', 'info_url', 'rating', 'style']
+BOOK_DELETE_FIELDS = ['id']
 
 
 def acquire_book_fields(book_data):
@@ -790,12 +938,13 @@ def update_book(user_details: dict) -> tuple:
         if field not in book_data or is_blank(book_data[field]):
             return generate_failure_response(f'{field} parameter is required', messages=[msg_missing_parameter(field)])
 
-    book_id = clean_string(book_data['id'])
+    book_id = book_data['id']
 
     existing_book = find_book_by_id(book_id)
 
     if existing_book is None:
-        return generate_failure_response(f'Book with ID {book_id} does not exist', 404, messages=[msg_action_cancelled_wrong()])
+        return generate_failure_response(f'Book with ID {book_id} does not exist', 404,
+                                         messages=[msg_action_cancelled_wrong()])
 
     updated_book = acquire_book_fields(book_data)
 
@@ -811,3 +960,84 @@ def update_book(user_details: dict) -> tuple:
         return generate_failure_response(f'Error updating book: {str(e)}', messages=[msg_action_failed()])
 
     return generate_success_response('Book updated successfully', messages=[msg_operation_complete()])
+
+
+@volume_blueprint.route('/guess/tags', methods=['POST'])
+@feature_required(volume_blueprint, VIEW_BOOKS)
+def guess_tags(user_details: dict) -> tuple:
+    if not current_app.config[PROPERTY_SERVER_VOLUME_READY]:
+        return generate_failure_response('Volume service not ready', 400, messages=[msg_server_error()])
+
+    values = clean_string(request.form.get('values'))
+    if is_blank(values):
+        return generate_failure_response('values parameter is required', messages=[msg_missing_parameter('values')])
+
+    words = [w.upper() for w in values.split() if w.strip()]
+    matched_tags = []
+    
+    i = 0
+    while i < len(words):
+        best_match = None
+        
+        # Try extending the sequence of words to find an exact tag match
+        for j in range(i, min(i + 6, len(words))):
+            candidate = ' '.join(words[i:j+1])
+            matching_tags = search_tags(candidate)
+            
+            # Check for exact equality among matches
+            for tag in matching_tags:
+                if tag.name == candidate:
+                    best_match = candidate
+                    break
+            
+            if best_match:
+                break
+        
+        if best_match:
+            # Consume all words that were part of the matched tag
+            word_count = len(best_match.split())
+            matched_tags.append(best_match)
+            i += word_count
+        else:
+            # No match found - this word is a new tag (unmatched)
+            matched_tags.append(words[i])
+            i += 1
+
+    return generate_success_response('', {'tags': matched_tags})
+
+
+@volume_blueprint.route('/remove', methods=['POST'])
+@feature_required(volume_blueprint, MANAGE_VOLUME)
+def remove_book(user_details: dict) -> tuple:
+    """
+    Update an existing book in the library.
+
+    Args:
+    user_details (dict): Details of the authenticated user.
+
+    Returns:
+    tuple: JSON response with the status of the operation and HTTP status code.
+    """
+    book_data = {}
+    for field in BOOK_FIELDS:
+        book_data[field] = clean_string(request.form.get(field))
+
+    for field in BOOK_DELETE_FIELDS:
+        if field not in book_data or is_blank(book_data[field]):
+            return generate_failure_response(f'{field} parameter is required', messages=[msg_missing_parameter(field)])
+
+    book_id = clean_string(book_data['id'])
+    existing_book = find_book_by_id(book_id)
+
+    if existing_book is None:
+        return generate_failure_response(f'Book with ID {book_id} does not exist', 404,
+                                         messages=[msg_action_cancelled_wrong()])
+
+    if manage_remove_book(existing_book):
+        folder_path = os.path.join(current_app.config[PROPERTY_SERVER_VOLUME_FOLDER], existing_book.id)
+        if os.path.exists(folder_path):
+            shutil.rmtree(folder_path, ignore_errors=True)
+    else:
+        return generate_failure_response(f'Error removing book: {str(book_id)}', messages=[msg_action_failed()])
+
+    return generate_success_response('Book removed successfully', messages=[msg_book_removed()])
